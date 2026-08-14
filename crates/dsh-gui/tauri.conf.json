@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DSH Desktop",
+  "version": "0.1.0",
+  "identifier": "ai.deepseek.dsh-desktop",
+  "build": {
+    "frontendDist": null
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "DSH Desktop contributors",
+    "shortDescription": "第三方开发的 DeepSeek Harness 桌面版（Tauri + WebView2）",
+    "license": "../../LICENSE",
+    "icon": ["icons/icon.ico"],
+    "resources": ["payload/**/*"],
+    "windows": {
+      "webviewInstallMode": { "type": "skip" },
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "installMode": "currentUser",
+        "installerHooks": "installer.nsh",
+        "displayLanguageSelector": false,
+        "startMenuFolder": "DSH Desktop"
+      }
+    }
+  }
+}

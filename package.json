@@ -1,0 +1,23 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.1.0",
+  "description": "DSH Desktop — 第三方开发的 DeepSeek Harness 桌面/命令行包装：Tauri GUI（Windows）+ 单二进制 CLI（Windows/Linux）",
+  "license": "MIT",
+  "private": true,
+  "author": "DSH Desktop contributors",
+  "scripts": {
+    "icons": "node scripts/make-icons.mjs",
+    "pack": "node scripts/pack-cli.mjs",
+    "pack:cli": "node scripts/pack-cli.mjs",
+    "pack:cli:linux": "node scripts/pack-cli.mjs --linux",
+    "pack:gui": "node scripts/pack-gui.mjs",
+    "sync:upstream": "node scripts/update-dsh.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-web-frontend": "0.0.1-rc.5"
+  }
+}

@@ -1,0 +1,107 @@
+name: release
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GUI + CLI（Windows）
+          - name: windows-x64
+            os: windows-latest
+          # 纯 CLI 单二进制（Linux）
+          - name: linux-x64
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/dsh-cli
+            crates/dsh-gui
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: node scripts/pack-cli.mjs --win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pack GUI installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: node scripts/pack-gui.mjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pack CLI (Linux)
+        if: runner.os == 'Linux'
+        run: node scripts/pack-cli.mjs --linux
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke test CLI single binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cli = (Get-ChildItem dist -Filter 'dsh-cli-*.exe' | Select-Object -First 1).FullName
+          & $cli --version
+          if ($LASTEXITCODE -ne 0) { throw "dsh-cli.exe smoke failed: $LASTEXITCODE" }
+
+      - name: Smoke test GUI installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist -Filter 'DSH-Desktop-*Setup*.exe' | Select-Object -First 1).FullName
+          Start-Process -FilePath $setup -ArgumentList '/S' -Wait
+          $dir = Join-Path $env:LOCALAPPDATA 'DSH Desktop'
+          $script = Join-Path $dir 'payload\app\node_modules\@deepseek-ai\dsh\lib\bin.js'
+          $node = Join-Path $dir 'payload\node\node.exe'
+          if (-not (Test-Path $script)) { throw "installer did not produce the payload" }
+          & $node $script --version
+          if ($LASTEXITCODE -ne 0) { throw "installed payload smoke failed: $LASTEXITCODE" }
+          Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S' -Wait
+          if (Test-Path $dir) { throw "uninstaller left $dir behind" }
+
+      - name: Smoke test CLI single binary (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x dist/dsh-cli-*-linux-x64
+          ./dist/dsh-cli-*-linux-x64 --version
+          echo "cli exit=$?"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dsh-cli-*
+            dist/DSH-Desktop-*

@@ -1,0 +1,40 @@
+name: sync-upstream
+
+on:
+  schedule:
+    # Weekly, Monday 03:00 UTC
+    - cron: '0 3 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync DeepSeek Harness payload
+        run: node scripts/update-dsh.mjs
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: 'chore: sync DeepSeek Harness payload'
+          branch: sync/dsh-payload
+          commit-message: 'chore: sync @deepseek-ai/dsh payload to latest'
+          body: |
+            Automated upstream sync: `@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend`
+            bumped to their latest npm releases.
+
+            Merging does NOT publish artifacts — cut a `v*` tag afterwards to
+            trigger `release.yml` for all platforms.
