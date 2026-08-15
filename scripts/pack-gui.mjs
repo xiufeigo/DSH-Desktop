@@ -47,9 +47,18 @@ cpSync(join(root, '.work', 'payload-win'), join(crateDir, 'payload'), { recursiv
 mkdirSync(join(crateDir, 'icons'), { recursive: true })
 cpSync(join(root, 'build', 'icon.ico'), join(crateDir, 'icons', 'icon.ico'), { force: true })
 
+// 清掉上一次构建残留的 setup：tauri build 不会删除旧版本安装包，
+// 否则按目录顺序取 setups[0] 可能拿到旧版本产物（例如 0.1.0 排在
+// 0.1.1 前面，导致新包名里装的是旧内容）。
+const bundle = join(crateDir, 'target', 'release', 'bundle', 'nsis')
+if (existsSync(bundle)) {
+  for (const name of readdirSync(bundle)) {
+    if (name.endsWith('-setup.exe')) rmSync(join(bundle, name), { force: true })
+  }
+}
+
 run('npx.cmd', ['tauri', 'build'], 'tauri build', { cwd: crateDir, shell: true })
 
-const bundle = join(crateDir, 'target', 'release', 'bundle', 'nsis')
 const setups = readdirSync(bundle).filter((n) => n.endsWith('-setup.exe'))
 if (setups.length === 0) throw new Error('pack-gui: no NSIS setup produced')
 const out = join(root, 'dist', `DSH-Desktop-Setup-${VERSION}.exe`)
