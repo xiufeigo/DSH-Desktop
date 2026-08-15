@@ -8,7 +8,7 @@
  * Usage: node scripts/prepare-payload.mjs <win|linux> <out-dir>
  */
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -72,6 +72,39 @@ const prune = (dir) => {
 }
 prune(destRoot)
 console.log(`prepare-payload: pruned ${prunedFiles} junk files + ${prunedDirs} test dir(s)`)
+
+// 4. windowsHide 补丁：GUI 进程自身没有控制台，dsh 通过
+//    dsh-subprocess-local 拉起 pwsh / bash / taskkill 等控制台程序时，
+//    若不设 windowsHide，Windows 会为每个子进程新开一个空白终端窗口。
+//    这里在载荷复制完成后给 spawn 点打补丁；若上游包结构变化导致
+//    匹配失败，直接报错而不是静默失效。
+{
+  const subprocessIndex = join(destRoot, '@deepseek-ai', 'dsh-subprocess-local', 'lib', 'index.js')
+  if (!existsSync(subprocessIndex)) {
+    throw new Error('prepare-payload: dsh-subprocess-local/lib/index.js missing from closure')
+  }
+  const patch = (source, from, to, what) => {
+    if (!source.includes(from)) {
+      throw new Error(`prepare-payload: windowsHide patch target missing (${what}) — upstream package changed?`)
+    }
+    return source.replace(from, to)
+  }
+  let source = readFileSync(subprocessIndex, 'utf8')
+  source = patch(
+    source,
+    'detached: platform !== "win32"',
+    'detached: platform !== "win32",\n\t\twindowsHide: true',
+    'spawn detached flag',
+  )
+  source = patch(
+    source,
+    '], { stdio: "ignore" });',
+    '], { stdio: "ignore", windowsHide: true });',
+    'taskkill spawnSync',
+  )
+  writeFileSync(subprocessIndex, source)
+  console.log('prepare-payload: patched dsh-subprocess-local spawn points with windowsHide:true')
+}
 
 // 4. Node runtime + license material.
 rmSync(join(outDir, 'node'), { recursive: true, force: true })

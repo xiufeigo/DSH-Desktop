@@ -1,6 +1,6 @@
 Rust crates statically linked into the dsh-gui / dsh-cli binaries
 =================================================================
-Generated 2026-08-14T09:34:29.390Z with cargo-license over the full cargo dependency closure of both crates.
+Generated 2026-08-15T17:03:07.048Z with cargo-license over the full cargo dependency closure of both crates.
 
 For crates declaring multiple license options, this project elects the permissive
 option (noted inline). No crate in this list is licensed under GPL/AGPL/EPL/CDDL/SSPL.
@@ -176,9 +176,9 @@ dom_query 0.27.0 — MIT
   niklak <morgenpurple@gmail.com>|importcjj <importcjj@gmail.com> | https://github.com/niklak/dom_query
 dpi 0.1.2 — Apache-2.0 AND MIT
   (no authors field) | https://github.com/rust-windowing/winit
-dsh-cli 0.1.0 — MIT
+dsh-cli 0.1.1 — MIT
   (no authors field)
-dsh-gui 0.1.0 — MIT
+dsh-gui 0.1.1 — MIT
   (no authors field)
 dtoa-short 0.3.5 — MPL-2.0
   Xidorn Quan <me@upsuper.org> | https://github.com/upsuper/dtoa-short

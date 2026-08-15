@@ -26,6 +26,54 @@ fn kill_server() {
     }
 }
 
+/// 把 dsh web 服务子进程挂进带 KILL_ON_JOB_CLOSE 的 Job Object。
+///
+/// GUI 主进程无论以何种方式退出（正常关闭、崩溃、以及安装器升级时的
+/// 强制终止），操作系统都会在本进程的句柄被关闭时终止整个作业——孤儿
+/// node.exe 随之退出，释放对 payload 文件（node.exe / ICU DLL / .node
+/// 插件等）的锁。否则安装器只杀主进程、残留 node 子进程锁文件，下次
+/// 覆盖安装会在拷贝 payload 时弹"打开文件写入时出错"。
+#[cfg(windows)]
+fn put_child_in_kill_job(child: &Child) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    unsafe {
+        let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) else {
+            return;
+        };
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let _ = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if let Ok(process) =
+            OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id())
+        {
+            if AssignProcessToJobObject(job, process).is_ok() {
+                // 挂入成功：不关闭 job 句柄（HANDLE 是 Copy 且无 Drop，
+                // 出作用域即自然留存）。本进程退出时系统代为关闭，
+                // 触发 KILL_ON_JOB_CLOSE 杀掉作业内全部子进程。
+                let _ = CloseHandle(process);
+                return;
+            }
+            let _ = CloseHandle(process);
+        }
+        // 挂入失败（例如环境已禁止嵌套作业）：关掉句柄，仅失去加固能力，
+        // 不影响应用运行。
+        let _ = CloseHandle(job);
+    }
+}
+
 /// Where the payload lives:
 /// 1. $DSH_PAYLOAD_DIR (explicit override)
 /// 2. <exe dir>/payload  (installed layout: payload/{node,app}/)
@@ -109,7 +157,10 @@ fn spawn_server(port: u16) -> std::io::Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    cmd.spawn()
+    let child = cmd.spawn()?;
+    #[cfg(windows)]
+    put_child_in_kill_job(&child);
+    Ok(child)
 }
 
 fn wait_ready(port: u16, timeout: Duration) -> bool {
@@ -203,7 +254,8 @@ fn main() {
             .inner_size(1440.0, 900.0)
             .min_inner_size(900.0, 640.0)
             // 无边框窗口：去掉系统标题栏，改由注入的 titlebar.js 提供
-            // 顶部隐形拖拽条与右上角悬浮的最小化/最大化/关闭按钮。
+            // 顶部可见顶栏（拖拽区 + 右侧窗口按钮），并把 web 内容整体下移，
+            // 顶栏不再遮挡应用内容。
             .decorations(false)
             // 毛玻璃：透明窗口 + Windows 亚克力材质，由 web UI 的透明
             // 画布与半透明侧栏透出（见 titlebar.js 注入的 frosted 样式）。
