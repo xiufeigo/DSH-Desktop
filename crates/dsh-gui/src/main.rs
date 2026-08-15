@@ -9,6 +9,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+#[cfg(windows)]
+use tauri::window::{Effect, EffectsBuilder};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -200,7 +202,21 @@ fn main() {
             .title("DSH Desktop")
             .inner_size(1440.0, 900.0)
             .min_inner_size(900.0, 640.0)
+            // 无边框窗口：去掉系统标题栏，改由注入的 titlebar.js 提供
+            // 顶部隐形拖拽条与右上角悬浮的最小化/最大化/关闭按钮。
+            .decorations(false)
+            // 毛玻璃：透明窗口 + Windows 亚克力材质，由 web UI 的透明
+            // 画布与半透明侧栏透出（见 titlebar.js 注入的 frosted 样式）。
+            .transparent(true)
+            .initialization_script(include_str!("titlebar.js"))
             .build()?;
+
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_effects(
+                    EffectsBuilder::new().effect(Effect::Acrylic).build(),
+                );
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

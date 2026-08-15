@@ -71,7 +71,6 @@ node scripts/pack-gui.mjs            # Windows GUI 安装程序 → dist/DSH-Des
 ```
 crates/dsh-cli/                   CLI 单二进制启动器（自解压 + exec node + 载荷追加打包器）
 crates/dsh-gui/                   GUI Tauri v2 壳（spawn dsh web + WebView2 窗口 + 单实例 + 缺失提示）
-crates/dsh-gui/installer.nsh      NSIS 钩子（安装目录加入用户 PATH，卸载时移除）
 scripts/prepare-payload.mjs       载荷准备：生产闭包复制 + 瘦身 + 许可证材料
 scripts/pack-cli.mjs / pack-gui.mjs  打包编排
 scripts/collect-notices.mjs       许可证审计：生成载荷内 THIRD_PARTY_NOTICES.txt（含 LGPL 补充）
