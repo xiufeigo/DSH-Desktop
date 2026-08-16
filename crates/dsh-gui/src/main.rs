@@ -216,6 +216,28 @@ fn show_webview2_missing() {
     }
 }
 
+/// 应用自身的 dsh web 服务地址（127.0.0.1 / localhost）。
+fn is_internal_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")
+}
+
+/// 用系统默认浏览器打开外部链接。消息里的链接是 `target="_blank"`，
+/// WebView2 默认拒绝新窗口请求——不接管的话点击毫无反应；同时防止
+/// 顶层导航把整个应用窗口带离 127.0.0.1 的 web UI。
+#[cfg(windows)]
+fn open_in_browser(url: &str) {
+    let _ = Command::new("cmd")
+        // 引号包裹 URL，避免查询串里的 & 被 cmd 当命令分隔符。
+        .args(["/C", "start", "", &format!("\"{url}\"")])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn();
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(url: &str) {
+    let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -224,6 +246,9 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        // 剪贴板插件：clipboard.js 用它兜底 WebView2 里不稳定的
+        // navigator.clipboard.writeText（复制按钮点击无反应的根因）。
+        .plugin(tauri_plugin_clipboard::init())
         .setup(move |app| {
             #[cfg(windows)]
             if !webview2_installed() {
@@ -261,6 +286,28 @@ fn main() {
             // 画布与半透明侧栏透出（见 titlebar.js 注入的 frosted 样式）。
             .transparent(true)
             .initialization_script(include_str!("titlebar.js"))
+            // 剪贴板写兜底：见 clipboard.js。
+            .initialization_script(include_str!("clipboard.js"))
+            // 顶层导航：内部地址放行，外站转到系统默认浏览器并拦截，
+            // 避免消息里的链接把整个应用窗口带离 web UI。
+            .on_navigation(|url| {
+                if is_internal_url(url.as_str()) {
+                    true
+                } else {
+                    open_in_browser(url.as_str());
+                    false
+                }
+            })
+            // target="_blank" 的新窗口请求：WebView2 默认拒绝（点了没反应），
+            // 这里把外站链接交给系统浏览器。
+            .on_new_window(|url, _features| {
+                if is_internal_url(url.as_str()) {
+                    tauri::webview::NewWindowResponse::Allow
+                } else {
+                    open_in_browser(url.as_str());
+                    tauri::webview::NewWindowResponse::Deny
+                }
+            })
             .build()?;
 
             #[cfg(windows)]

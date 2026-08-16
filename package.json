@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH Desktop — 第三方开发的 DeepSeek Harness 桌面/命令行包装：Tauri GUI（Windows）+ 单二进制 CLI（Windows/Linux）",
   "license": "MIT",
   "private": true,

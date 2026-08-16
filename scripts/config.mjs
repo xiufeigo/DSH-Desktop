@@ -1,7 +1,7 @@
 /** Shared packaging configuration for DSH Desktop. */
 
 export const APP_ID = 'ai.deepseek.dsh-desktop'
-export const VERSION = '0.1.1'
+export const VERSION = '0.1.2'
 
 /** Node.js release channel bundled as the sidecar runtime. */
 export const NODE_CHANNEL = '24'
