@@ -1,0 +1,19 @@
+---
+description: 打包前必须同步官方 DeepSeek Harness，并用官方版本加末位小版本号
+alwaysApply: true
+---
+
+# 打包前同步官方
+
+官方仓库：https://github.com/deepseek-ai/deepseek-harness  
+载荷真相源：npm `@deepseek-ai/dsh`（由该仓库发布）。不要改 `@deepseek-ai/*` 源码。
+
+用户说「打包」（`pack-gui` / `pack-cli` / 打安装包）时：
+
+1. 先跑 `node scripts/sync-and-bump.mjs`（查 GitHub tag + npm latest；npm 有新版本则跑 `update-dsh.mjs`；然后递增桌面版小版本号）。
+2. 桌面版版本 = 官方版本 + `.N`。官方 `0.1.0-rc.7` → 我们 `0.1.0-rc.7.1`；同一官方版本每打一次包 `N+1`；官方升级则从 `.1` 重来。
+3. 一次「打包」只 bump 一次。同时打 GUI 和 CLI 时：先 `sync-and-bump.mjs`，再两个 pack 都加 `--skip-prepare`。
+4. 查不到官方版本就停止，不要用旧 pin 闷头出包。
+5. 用户没说打包时不要擅自 bump / sync。
+
+版本写在：`scripts/config.mjs`、`package.json`、`package-lock.json`、`crates/dsh-gui/{Cargo.toml,tauri.conf.json}`、`crates/dsh-cli/Cargo.toml`。

@@ -8,13 +8,56 @@
  * Usage: node scripts/prepare-payload.mjs <win|linux> <out-dir>
  */
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join, relative, resolve } from 'node:path'
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findPackageCopies, verifyPayloadContract, writePayloadManifest } from './payload-contract.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const plat = process.argv[2] === 'linux' ? 'linux' : 'win'
+const plat = process.argv[2]
+if (plat !== 'win' && plat !== 'linux') {
+  throw new Error('prepare-payload: target must be exactly "win" or "linux"')
+}
+if (process.arch !== 'x64') {
+  throw new Error(`prepare-payload: only x64 payloads are supported, got ${process.arch}`)
+}
 const outDir = resolve(root, process.argv[3] ?? join('.work', `payload-${plat}`))
+const workRoot = resolve(root, '.work')
+const pathKey = (path) => process.platform === 'win32' ? path.toLowerCase() : path
+const outFromWork = relative(workRoot, outDir)
+if (
+  outFromWork === '' ||
+  outFromWork === '..' ||
+  outFromWork.startsWith(`..${sep}`) ||
+  isAbsolute(outFromWork) ||
+  pathKey(dirname(outDir)) !== pathKey(workRoot) ||
+  !basename(outDir).startsWith('payload-')
+) {
+  throw new Error(`prepare-payload: output directory must be a ${workRoot}${sep}payload-* path, got ${outDir}`)
+}
+
+mkdirSync(workRoot, { recursive: true })
+const workStat = lstatSync(workRoot)
+const realRoot = realpathSync(root)
+const realWorkRoot = realpathSync(workRoot)
+if (
+  !workStat.isDirectory() ||
+  workStat.isSymbolicLink() ||
+  pathKey(dirname(realWorkRoot)) !== pathKey(realRoot)
+) {
+  throw new Error(`prepare-payload: .work must be a real directory directly below the repository, got ${realWorkRoot}`)
+}
+if (existsSync(outDir)) {
+  const outStat = lstatSync(outDir)
+  const realOutDir = realpathSync(outDir)
+  if (
+    !outStat.isDirectory() ||
+    outStat.isSymbolicLink() ||
+    pathKey(dirname(realOutDir)) !== pathKey(realWorkRoot)
+  ) {
+    throw new Error(`prepare-payload: refusing to replace non-directory or redirected output ${realOutDir}`)
+  }
+}
 
 const run = (args, label) => {
   console.log(`prepare-payload: ${label}: node ${args.join(' ')}`)
@@ -24,18 +67,21 @@ const run = (args, label) => {
 
 // 1. Node runtime (reuses the cached download).
 run(['scripts/fetch-node.mjs', plat], 'node runtime')
+rmSync(outDir, { recursive: true, force: true })
 
 // 2. Production closure -> out/app/node_modules (mirrors after-pack.cjs sync logic).
 const destRoot = join(outDir, 'app', 'node_modules')
-rmSync(join(outDir, 'app'), { recursive: true, force: true })
 mkdirSync(destRoot, { recursive: true })
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const ls = spawnSync(
   npm,
   ['ls', '--omit=dev', '--all', '--parseable', '--silent'],
-  { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], shell: process.platform === 'win32' },
+  { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' },
 )
 if (ls.error !== undefined) throw ls.error
+if (ls.status !== 0) {
+  throw new Error(`prepare-payload: npm dependency tree is invalid (exit ${String(ls.status)}):\n${ls.stderr ?? ''}`)
+}
 let copied = 0
 for (const line of (ls.stdout ?? '').split(/\r?\n/)) {
   const trimmed = line.trim()
@@ -51,7 +97,26 @@ for (const line of (ls.stdout ?? '').split(/\r?\n/)) {
 }
 console.log(`prepare-payload: copied ${copied} packages to app/node_modules`)
 
-// 3. Prune packaging junk (never loaded at runtime; LICENSE files kept).
+// 3. Keep only the native prebuild for this target. Linux node-pty may use
+// build/Release instead of a prebuild, which is intentionally preserved.
+// Windows node-pty 1.2 ships conpty.node (older builds used pty.node).
+const nodePtyCopies = findPackageCopies(destRoot, 'node-pty')
+if (nodePtyCopies.length !== 1) {
+  throw new Error(`prepare-payload: expected one node-pty package, found ${String(nodePtyCopies.length)}`)
+}
+const targetPrebuild = plat === 'win' ? 'win32-x64' : 'linux-x64'
+const prebuildsDir = join(nodePtyCopies[0].packageDir, 'prebuilds')
+if (existsSync(prebuildsDir)) {
+  for (const entry of readdirSync(prebuildsDir, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name !== targetPrebuild) {
+      rmSync(join(prebuildsDir, entry.name), { recursive: true, force: true })
+    }
+  }
+}
+rmSync(join(nodePtyCopies[0].packageDir, 'build', 'Debug'), { recursive: true, force: true })
+
+// 4. Prune files that cannot participate in JavaScript runtime resolution.
+// LICENSE/NOTICE, Markdown, source files, runtime config and package manifests stay.
 let prunedFiles = 0
 let prunedDirs = 0
 const prune = (dir) => {
@@ -64,16 +129,16 @@ const prune = (dir) => {
       } else {
         prune(full)
       }
-    } else if (entry.name.endsWith('.map') || entry.name.endsWith('.d.ts')) {
+    } else if (/\.(?:map|pdb|d\.ts|d\.mts|d\.cts)$/i.test(entry.name)) {
       rmSync(full, { force: true })
       prunedFiles += 1
     }
   }
 }
 prune(destRoot)
-console.log(`prepare-payload: pruned ${prunedFiles} junk files + ${prunedDirs} test dir(s)`)
+console.log(`prepare-payload: pruned ${prunedFiles} non-runtime files + ${prunedDirs} test dir(s)`)
 
-// 4. windowsHide 补丁：GUI 进程自身没有控制台，dsh 通过
+// 5. windowsHide 补丁：GUI 进程自身没有控制台，dsh 通过
 //    dsh-subprocess-local 拉起 pwsh / bash / taskkill 等控制台程序时，
 //    若不设 windowsHide，Windows 会为每个子进程新开一个空白终端窗口。
 //    这里在载荷复制完成后给 spawn 点打补丁；若上游包结构变化导致
@@ -96,23 +161,34 @@ console.log(`prepare-payload: pruned ${prunedFiles} junk files + ${prunedDirs} t
     'detached: platform !== "win32",\n\t\twindowsHide: true',
     'spawn detached flag',
   )
-  source = patch(
-    source,
-    '], { stdio: "ignore" });',
-    '], { stdio: "ignore", windowsHide: true });',
-    'taskkill spawnSync',
-  )
+  const taskkillFrom = '], { stdio: "ignore" });'
+  const taskkillTo = '], { stdio: "ignore", windowsHide: true });'
+  const taskkillHits = source.split(taskkillFrom).length - 1
+  if (taskkillHits === 0) {
+    throw new Error('prepare-payload: windowsHide patch target missing (taskkill spawnSync) — upstream package changed?')
+  }
+  source = source.split(taskkillFrom).join(taskkillTo)
   writeFileSync(subprocessIndex, source)
-  console.log('prepare-payload: patched dsh-subprocess-local spawn points with windowsHide:true')
+  console.log(
+    `prepare-payload: patched dsh-subprocess-local spawn points with windowsHide:true (${String(taskkillHits)} taskkill site(s))`,
+  )
 }
 
-// 4. Node runtime + license material.
-rmSync(join(outDir, 'node'), { recursive: true, force: true })
-cpSync(join(root, 'payload', 'node'), join(outDir, 'node'), { recursive: true, force: true })
+// 6. The shell invokes only Node itself. npm, npx and corepack are not runtime
+// dependencies, so stage the executable and the upstream license only.
+const fetchedNode = join(root, 'payload', 'node')
+const stagedNode = join(outDir, 'node')
+mkdirSync(plat === 'win' ? stagedNode : join(stagedNode, 'bin'), { recursive: true })
+cpSync(
+  plat === 'win' ? join(fetchedNode, 'node.exe') : join(fetchedNode, 'bin', 'node'),
+  plat === 'win' ? join(stagedNode, 'node.exe') : join(stagedNode, 'bin', 'node'),
+  { force: true, preserveTimestamps: true },
+)
+cpSync(join(fetchedNode, 'LICENSE'), join(stagedNode, 'LICENSE'), { force: true })
 run(['scripts/collect-notices.mjs', join(outDir, 'THIRD_PARTY_NOTICES.txt')], 'third-party notices')
 cpSync(join(root, 'LICENSE'), join(outDir, 'LICENSE'))
 
-// 5. Statically linked Rust crates section (vendored manifest, see collect-rust-licenses.mjs).
+// 7. Statically linked Rust crates section (vendored manifest, see collect-rust-licenses.mjs).
 const rustManifest = join(root, 'build', 'rust-licenses.txt')
 if (!existsSync(rustManifest)) {
   throw new Error('prepare-payload: build/rust-licenses.txt missing — run `node scripts/collect-rust-licenses.mjs` first')
@@ -122,4 +198,9 @@ appendFileSync(
   `\n${readFileSync(rustManifest, 'utf8')}`,
 )
 
-console.log(`prepare-payload: staged payload at ${outDir}`)
+const manifest = writePayloadManifest(outDir, plat)
+verifyPayloadContract(outDir, plat)
+console.log(
+  `prepare-payload: staged ${String(manifest.files)} files, ${(manifest.bytes / 1024 / 1024).toFixed(1)} MiB, ` +
+  `frontend ${manifest.frontend.version}, ${String(manifest.nativeModules.length)} native module(s) at ${outDir}`,
+)

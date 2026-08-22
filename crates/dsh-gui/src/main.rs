@@ -1,23 +1,119 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod startup;
+
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use startup::ChildState;
+use tauri::window::Color;
 #[cfg(windows)]
 use tauri::window::{Effect, EffectsBuilder};
+use tauri::{Manager, RunEvent, UserAttentionType, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
+static STARTUP_TRACE: OnceLock<StartupTrace> = OnceLock::new();
+static INTERACTIVE_REPORTED: AtomicBool = AtomicBool::new(false);
+static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
 
 const WEBVIEW2_URL: &str = "https://developer.microsoft.com/microsoft-edge/webview2/";
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct StartupTrace {
+    started: Instant,
+    file: Option<Mutex<File>>,
+}
+
+fn init_startup_trace() -> std::io::Result<()> {
+    let enabled = std::env::var("DSH_STARTUP_TRACE").as_deref() == Ok("1");
+    let file = if enabled {
+        let dir = log_dir();
+        fs::create_dir_all(&dir)?;
+        Some(Mutex::new(File::create(dir.join("startup-trace.jsonl"))?))
+    } else {
+        None
+    };
+    let _ = STARTUP_TRACE.set(StartupTrace {
+        started: Instant::now(),
+        file,
+    });
+    trace_startup("process_started", None);
+    Ok(())
+}
+
+fn trace_startup(phase: &str, detail: Option<&str>) {
+    let Some(trace) = STARTUP_TRACE.get() else {
+        return;
+    };
+    let Some(file) = &trace.file else {
+        return;
+    };
+    let record = serde_json::json!({
+        "elapsed_ms": trace.started.elapsed().as_secs_f64() * 1000.0,
+        "phase": phase,
+        "detail": detail,
+    });
+    let mut file = file.lock().expect("startup trace lock poisoned");
+    writeln!(file, "{record}").expect("failed to write startup trace");
+}
+
+fn startup_trace_enabled() -> bool {
+    STARTUP_TRACE
+        .get()
+        .is_some_and(|trace| trace.file.is_some())
+}
+
+#[tauri::command]
+fn startup_interactive() {
+    if INTERACTIVE_REPORTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        trace_startup("interactive", None);
+    }
+}
+
+fn clip_notify_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+/// Windows toast for session wait/finish. Skip when the main window is focused
+/// so the user is not pinged by a card they can already see. Taskbar flash
+/// still runs when the window is in the background.
+#[tauri::command]
+fn show_desktop_notification(app: tauri::AppHandle, title: String, body: String) {
+    let title = clip_notify_text(&title, 80);
+    let body = clip_notify_text(&body, 200);
+    if title.is_empty() {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_focused().unwrap_or(false) {
+            return;
+        }
+        let _ = window.request_user_attention(Some(UserAttentionType::Informational));
+    }
+    let _ = app
+        .notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show();
+}
 
 fn kill_server() {
     if let Some(mut child) = SERVER.lock().unwrap().take() {
@@ -34,7 +130,7 @@ fn kill_server() {
 /// 插件等）的锁。否则安装器只杀主进程、残留 node 子进程锁文件，下次
 /// 覆盖安装会在拷贝 payload 时弹"打开文件写入时出错"。
 #[cfg(windows)]
-fn put_child_in_kill_job(child: &Child) {
+fn put_child_in_kill_job(child: &Child) -> std::io::Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::JobObjects::{
@@ -45,32 +141,41 @@ fn put_child_in_kill_job(child: &Child) {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
     unsafe {
-        let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) else {
-            return;
-        };
+        let job = CreateJobObjectW(None, PCWSTR::null())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let _ = SetInformationJobObject(
+        if let Err(error) = SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        );
-        if let Ok(process) =
-            OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id())
-        {
-            if AssignProcessToJobObject(job, process).is_ok() {
-                // 挂入成功：不关闭 job 句柄（HANDLE 是 Copy 且无 Drop，
-                // 出作用域即自然留存）。本进程退出时系统代为关闭，
-                // 触发 KILL_ON_JOB_CLOSE 杀掉作业内全部子进程。
-                let _ = CloseHandle(process);
-                return;
-            }
-            let _ = CloseHandle(process);
+        ) {
+            let _ = CloseHandle(job);
+            return Err(std::io::Error::other(format!(
+                "failed to enable KILL_ON_JOB_CLOSE: {error}"
+            )));
         }
-        // 挂入失败（例如环境已禁止嵌套作业）：关掉句柄，仅失去加固能力，
-        // 不影响应用运行。
-        let _ = CloseHandle(job);
+        let process = match OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id()) {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = CloseHandle(job);
+                return Err(std::io::Error::other(format!(
+                    "failed to open dsh web process for job assignment: {error}"
+                )));
+            }
+        };
+        if let Err(error) = AssignProcessToJobObject(job, process) {
+            let _ = CloseHandle(process);
+            let _ = CloseHandle(job);
+            return Err(std::io::Error::other(format!(
+                "failed to assign dsh web to kill job: {error}"
+            )));
+        }
+        let _ = CloseHandle(process);
+        // Intentionally retain the job handle until process exit so Windows applies
+        // KILL_ON_JOB_CLOSE to the entire dsh web process tree.
+        Ok(())
     }
 }
 
@@ -127,60 +232,118 @@ fn log_dir() -> PathBuf {
         .join("logs")
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("no free loopback port")
-        .local_addr()
-        .unwrap()
-        .port()
+fn capture_server_stdout(
+    stdout: ChildStdout,
+    mut log: File,
+    endpoint: SyncSender<Result<u16, startup::WaitReadyError>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut endpoint = Some(endpoint);
+    let mut log_available = true;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => {
+                if let Some(endpoint) = endpoint.take() {
+                    let _ = endpoint.try_send(Err(startup::WaitReadyError::LogRead(
+                        "dsh web stdout closed before reporting an endpoint".to_string(),
+                    )));
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(endpoint) = endpoint.take() {
+                    let _ =
+                        endpoint.try_send(Err(startup::WaitReadyError::LogRead(error.to_string())));
+                }
+                return;
+            }
+        }
+
+        if log_available {
+            if let Err(error) = log.write_all(&line) {
+                log_available = false;
+                if let Some(endpoint) = endpoint.take() {
+                    let _ = endpoint.try_send(Err(startup::WaitReadyError::LogRead(format!(
+                        "failed to persist dsh web stdout: {error}"
+                    ))));
+                }
+            }
+        }
+        if let Some(sender) = endpoint.as_ref() {
+            match startup::parse_server_port(&String::from_utf8_lossy(&line)) {
+                Ok(Some(port)) => {
+                    let _ = sender.try_send(Ok(port));
+                    endpoint = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = sender.try_send(Err(error));
+                    endpoint = None;
+                }
+            }
+        }
+    }
 }
 
-fn spawn_server(port: u16) -> std::io::Result<Child> {
+fn spawn_server() -> std::io::Result<(Child, Receiver<Result<u16, startup::WaitReadyError>>)> {
     let dir = log_dir();
     fs::create_dir_all(&dir)?;
-    let stdout = File::create(dir.join("dsh-web.log"))?;
-    let stderr = stdout.try_clone()?;
+    let stdout_log = File::create(dir.join("dsh-web.log"))?;
+    let stderr = stdout_log.try_clone()?;
     let mut cmd = Command::new(node_binary());
     // GUI 程序没有控制台；不给 console 子系统的 node 子进程分配新控制台，
     // 否则每次启动都会闪一个黑色 cmd 窗口。
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd.arg(dsh_script())
-        .args([
-            "--profile",
-            "web",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
+        .args(["--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     #[cfg(windows)]
-    put_child_in_kill_job(&child);
-    Ok(child)
+    if let Err(error) = put_child_in_kill_job(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("dsh web stdout pipe was not created"));
+        }
+    };
+    let (endpoint_tx, endpoint_rx) = mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .name("dsh-stdout".to_string())
+        .spawn(move || capture_server_stdout(stdout, stdout_log, endpoint_tx))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok((child, endpoint_rx))
 }
 
-fn wait_ready(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-            if stream.write_all(req.as_bytes()).is_ok() {
-                let mut buf = Vec::new();
-                if stream.read_to_end(&mut buf).is_ok()
-                    && String::from_utf8_lossy(&buf).starts_with("HTTP/1.")
-                {
-                    return true;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    false
+fn server_state() -> Result<ChildState, String> {
+    let mut server = SERVER
+        .lock()
+        .map_err(|_| "server process lock poisoned".to_string())?;
+    let Some(child) = server.as_mut() else {
+        return Ok(ChildState::Exited(None));
+    };
+    child
+        .try_wait()
+        .map(|status| match status {
+            Some(status) => ChildState::Exited(status.code()),
+            None => ChildState::Running,
+        })
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
@@ -191,15 +354,22 @@ fn webview2_installed() -> bool {
         r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
     const HKCU_PATH: &str =
         r"Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
-    RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(HKLM_PATH).is_ok()
-        || RegKey::predef(HKEY_CURRENT_USER).open_subkey(HKCU_PATH).is_ok()
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(HKLM_PATH)
+        .is_ok()
+        || RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(HKCU_PATH)
+            .is_ok()
 }
 
 #[cfg(windows)]
 fn show_webview2_missing() {
     use windows::core::PCWSTR;
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
-    let title: Vec<u16> = "DSH Desktop".encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "DSH Desktop"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let text: Vec<u16> = format!(
         "未检测到 Microsoft Edge WebView2 运行时，DSH Desktop 需要它来显示界面。\n\n请从以下地址下载安装后重试：\n{WEBVIEW2_URL}"
     )
@@ -216,9 +386,42 @@ fn show_webview2_missing() {
     }
 }
 
-/// 应用自身的 dsh web 服务地址（127.0.0.1 / localhost）。
-fn is_internal_url(url: &str) -> bool {
-    url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")
+#[cfg(windows)]
+fn show_startup_error(message: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let title: Vec<u16> = "DSH Desktop"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_startup_error(message: &str) {
+    eprintln!("DSH Desktop: {message}");
+}
+
+fn is_trusted_navigation(url: &tauri::Url, port: u16) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match (url.scheme(), url.host_str(), url.port()) {
+        ("tauri", Some("localhost"), None) => true,
+        ("http" | "https", Some("tauri.localhost"), None) => true,
+        ("http", Some("127.0.0.1" | "localhost"), Some(candidate)) => {
+            port != 0 && candidate == port
+        }
+        _ => false,
+    }
 }
 
 /// 用系统默认浏览器打开外部链接。消息里的链接是 `target="_blank"`，
@@ -226,11 +429,22 @@ fn is_internal_url(url: &str) -> bool {
 /// 顶层导航把整个应用窗口带离 127.0.0.1 的 web UI。
 #[cfg(windows)]
 fn open_in_browser(url: &str) {
-    let _ = Command::new("cmd")
-        // 引号包裹 URL，避免查询串里的 & 被 cmd 当命令分隔符。
-        .args(["/C", "start", "", &format!("\"{url}\"")])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .spawn();
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let action: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            PCWSTR(action.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
 }
 
 #[cfg(not(windows))]
@@ -238,7 +452,81 @@ fn open_in_browser(url: &str) {
     let _ = Command::new("xdg-open").arg(url).spawn();
 }
 
+fn fail_startup(app: &tauri::AppHandle, message: String) {
+    trace_startup("startup_failed", Some(&message));
+    let window_exists = app.get_webview_window("main").is_some();
+    kill_server();
+    if !window_exists {
+        return;
+    }
+    show_startup_error(&message);
+    app.exit(1);
+}
+
+fn finish_startup(app: tauri::AppHandle, endpoint: Receiver<Result<u16, startup::WaitReadyError>>) {
+    let started = Instant::now();
+    let log = log_dir().join("dsh-web.log");
+    let port = match startup::wait_server_port(&endpoint, READY_TIMEOUT, server_state) {
+        Ok(port) => port,
+        Err(error) => {
+            fail_startup(
+                &app,
+                format!(
+                    "DSH 后端未能报告监听地址：{error}\n\n请查看日志：{}",
+                    log.display()
+                ),
+            );
+            return;
+        }
+    };
+    SERVER_PORT.store(port, Ordering::Release);
+    trace_startup("server_listening", Some(&format!("port={port}")));
+
+    let remaining = READY_TIMEOUT.saturating_sub(started.elapsed());
+    match startup::wait_ready(port, remaining, server_state) {
+        Ok(()) => {
+            trace_startup("backend_ready", None);
+            match server_state() {
+                Ok(ChildState::Running) => {}
+                Ok(ChildState::Exited(code)) => {
+                    fail_startup(
+                        &app,
+                        format!("DSH 后端在界面加载前退出（退出码：{code:?}）"),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    fail_startup(&app, format!("无法确认 DSH 后端状态：{error}"));
+                    return;
+                }
+            }
+            let Some(window) = app.get_webview_window("main") else {
+                kill_server();
+                return;
+            };
+            let url = tauri::Url::parse(&format!("http://127.0.0.1:{port}/"))
+                .expect("loopback startup URL must be valid");
+            if let Err(error) = window.navigate(url) {
+                fail_startup(&app, format!("无法加载 DSH 界面：{error}"));
+                return;
+            }
+            trace_startup("navigation_requested", None);
+        }
+        Err(error) => {
+            fail_startup(
+                &app,
+                format!("DSH 后端未能就绪：{error}\n\n请查看日志：{}", log.display()),
+            );
+        }
+    }
+}
+
 fn main() {
+    if let Err(error) = init_startup_trace() {
+        show_startup_error(&format!("无法创建启动跟踪日志：{error}"));
+        std::process::exit(1);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -249,72 +537,97 @@ fn main() {
         // 剪贴板插件：clipboard.js 用它兜底 WebView2 里不稳定的
         // navigator.clipboard.writeText（复制按钮点击无反应的根因）。
         .plugin(tauri_plugin_clipboard::init())
-        .setup(move |app| {
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            startup_interactive,
+            show_desktop_notification
+        ])
+        .setup(|app| {
             #[cfg(windows)]
             if !webview2_installed() {
+                trace_startup("startup_failed", Some("WebView2 runtime missing"));
                 show_webview2_missing();
                 std::process::exit(2);
             }
 
-            let port = free_port();
-            match spawn_server(port) {
-                Ok(child) => *SERVER.lock().unwrap() = Some(child),
-                Err(e) => {
-                    eprintln!("dsh-gui: 启动 dsh 失败: {e}");
-                    std::process::exit(1);
+            let endpoint = match spawn_server() {
+                Ok((child, endpoint)) => {
+                    *SERVER.lock().unwrap() = Some(child);
+                    trace_startup("server_spawned", None);
+                    endpoint
                 }
-            }
-            if !wait_ready(port, Duration::from_secs(60)) {
-                eprintln!("dsh-gui: dsh web 服务未在 60 秒内就绪");
-                kill_server();
-                std::process::exit(1);
-            }
+                Err(error) => {
+                    let message = format!("无法启动 DSH 后端：{error}");
+                    trace_startup("startup_failed", Some(&message));
+                    show_startup_error(&message);
+                    return Err(error.into());
+                }
+            };
 
-            WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::External(format!("http://127.0.0.1:{port}").parse().unwrap()),
-            )
-            .title("DSH Desktop")
-            .inner_size(1440.0, 900.0)
-            .min_inner_size(900.0, 640.0)
-            // 无边框窗口：去掉系统标题栏，改由注入的 titlebar.js 提供
-            // 顶部可见顶栏（拖拽区 + 右侧窗口按钮），并把 web 内容整体下移，
-            // 顶栏不再遮挡应用内容。
-            .decorations(false)
-            // 毛玻璃：透明窗口 + Windows 亚克力材质，由 web UI 的透明
-            // 画布与半透明侧栏透出（见 titlebar.js 注入的 frosted 样式）。
-            .transparent(true)
-            .initialization_script(include_str!("titlebar.js"))
-            // 剪贴板写兜底：见 clipboard.js。
-            .initialization_script(include_str!("clipboard.js"))
-            // 顶层导航：内部地址放行，外站转到系统默认浏览器并拦截，
-            // 避免消息里的链接把整个应用窗口带离 web UI。
-            .on_navigation(|url| {
-                if is_internal_url(url.as_str()) {
-                    true
-                } else {
-                    open_in_browser(url.as_str());
-                    false
-                }
-            })
-            // target="_blank" 的新窗口请求：WebView2 默认拒绝（点了没反应），
-            // 这里把外站链接交给系统浏览器。
-            .on_new_window(|url, _features| {
-                if is_internal_url(url.as_str()) {
-                    tauri::webview::NewWindowResponse::Allow
-                } else {
-                    open_in_browser(url.as_str());
-                    tauri::webview::NewWindowResponse::Deny
-                }
-            })
-            .build()?;
+            let window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("DSH Desktop")
+                    .inner_size(1440.0, 900.0)
+                    .min_inner_size(900.0, 640.0)
+                    // 无边框窗口：去掉系统标题栏，改由注入的 titlebar.js 提供
+                    // 顶部可见顶栏（拖拽区 + 右侧窗口按钮）。启动页顶栏与内容
+                    // 共用同一块亚克力；进入 web UI 后把内容整体下移，顶栏不再
+                    // 遮挡应用内容。
+                    .decorations(false)
+                    // 毛玻璃：透明窗口 + Windows 亚克力材质。启动页整窗透出；
+                    // 进入 web UI 后由半透明侧栏（透明度可调）透出，工作区保持
+                    // 不透明（见 titlebar.js）。
+                    .transparent(true)
+                    // WebView2 默认白底会把 CSS 透明像素合成回实白，亚克力
+                    // 透不出来。alpha=0 才走窗口材质。
+                    .background_color(Color(0, 0, 0, 0))
+                    .initialization_script(include_str!("titlebar.js"))
+                    // 会话通知：见 notify.js。
+                    .initialization_script(include_str!("notify.js"))
+                    // 剪贴板写兜底：见 clipboard.js。
+                    .initialization_script(include_str!("clipboard.js"))
+                    // 启动追踪：在真实 Web UI 出现第一个可交互控件时回报。
+                    .initialization_script(if startup_trace_enabled() {
+                        include_str!("startup.js")
+                    } else {
+                        ""
+                    })
+                    // 顶层导航：内部地址放行，外站转到系统默认浏览器并拦截，
+                    // 避免消息里的链接把整个应用窗口带离 web UI。
+                    .on_navigation(move |url| {
+                        if is_trusted_navigation(url, SERVER_PORT.load(Ordering::Acquire)) {
+                            true
+                        } else {
+                            open_in_browser(url.as_str());
+                            false
+                        }
+                    })
+                    // target="_blank" 的新窗口请求：WebView2 默认拒绝（点了没反应），
+                    // 这里把外站链接交给系统浏览器。
+                    .on_new_window(move |url, _features| {
+                        if is_trusted_navigation(&url, SERVER_PORT.load(Ordering::Acquire)) {
+                            tauri::webview::NewWindowResponse::Allow
+                        } else {
+                            open_in_browser(url.as_str());
+                            tauri::webview::NewWindowResponse::Deny
+                        }
+                    })
+                    .build()?;
+            trace_startup("webview_created", None);
 
             #[cfg(windows)]
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_effects(
-                    EffectsBuilder::new().effect(Effect::Acrylic).build(),
-                );
+            let _ = window.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build());
+
+            let app_handle = app.handle().clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("dsh-readiness".to_string())
+                .spawn(move || finish_startup(app_handle, endpoint))
+            {
+                let message = format!("无法启动就绪检测线程：{error}");
+                trace_startup("startup_failed", Some(&message));
+                kill_server();
+                show_startup_error(&message);
+                return Err(error.into());
             }
             Ok(())
         })
@@ -325,4 +638,43 @@ fn main() {
                 kill_server();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_allows_only_the_current_loopback_service_and_app_origin() {
+        let port = 49_152;
+        for allowed in [
+            "http://127.0.0.1:49152/",
+            "http://localhost:49152/session",
+            "http://tauri.localhost/",
+            "tauri://localhost/index.html",
+        ] {
+            let url = tauri::Url::parse(allowed).unwrap();
+            assert!(
+                is_trusted_navigation(&url, port),
+                "expected allowed: {allowed}"
+            );
+        }
+
+        for rejected in [
+            "http://127.0.0.1:49153/",
+            "http://127.0.0.1:49152@evil.example/",
+            "http://127.0.0.1.evil.example:49152/",
+            "https://127.0.0.1:49152/",
+            "https://example.com/",
+            "file:///C:/Windows/System32/calc.exe",
+            "data:text/html,hello",
+            "javascript:alert(1)",
+        ] {
+            let url = tauri::Url::parse(rejected).unwrap();
+            assert!(
+                !is_trusted_navigation(&url, port),
+                "expected rejected: {rejected}"
+            );
+        }
+    }
 }

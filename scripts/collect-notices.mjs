@@ -18,9 +18,12 @@ const MAX_LICENSE_TEXT = 50_000
 const result = spawnSync(
   process.platform === 'win32' ? 'npm.cmd' : 'npm',
   ['ls', '--omit=dev', '--all', '--parseable', '--silent'],
-  { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], shell: process.platform === 'win32' },
+  { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' },
 )
 if (result.error !== undefined) throw result.error
+if (result.status !== 0) {
+  throw new Error(`collect-notices: npm dependency tree is invalid (exit ${String(result.status)}):\n${result.stderr ?? ''}`)
+}
 
 const declaredLicense = (pkg) => {
   if (typeof pkg.license === 'string') return pkg.license

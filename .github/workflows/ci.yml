@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  payload:
+    name: payload (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: win
+            os: windows-latest
+          - target: linux
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/dsh-cli
+            crates/dsh-gui
+
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: node-runtime-${{ runner.os }}-${{ hashFiles('scripts/config.mjs') }}
+
+      - name: Install pinned dependencies
+        run: npm ci
+
+      - name: Validate dependency ownership
+        run: npm test
+
+      - name: Validate production dependency tree
+        run: npm ls --omit=dev --all --silent
+
+      - name: Build payload
+        run: node scripts/prepare-payload.mjs ${{ matrix.target }}
+
+      - name: Smoke payload CLI, Web and native modules
+        run: node scripts/verify-payload.mjs ${{ matrix.target }}
+
+      - name: Test CLI launcher
+        run: cargo test --manifest-path crates/dsh-cli/Cargo.toml
+
+      - name: Test GUI readiness and navigation
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path crates/dsh-gui/Cargo.toml

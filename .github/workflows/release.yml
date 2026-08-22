@@ -80,6 +80,36 @@ jobs:
           if (-not (Test-Path $script)) { throw "installer did not produce the payload" }
           & $node $script --version
           if ($LASTEXITCODE -ne 0) { throw "installed payload smoke failed: $LASTEXITCODE" }
+
+          $trace = Join-Path $env:APPDATA 'dsh-desktop\logs\startup-trace.jsonl'
+          if (Test-Path -LiteralPath $trace) {
+            Remove-Item -LiteralPath $trace -Force
+          }
+          $gui = (Get-ChildItem $dir -Filter '*.exe' | Where-Object Name -ne 'uninstall.exe' | Select-Object -First 1).FullName
+          $env:DSH_STARTUP_TRACE = '1'
+          $process = Start-Process -FilePath $gui -PassThru
+          $interactive = $false
+          $deadline = [DateTime]::UtcNow.AddSeconds(60)
+          while ([DateTime]::UtcNow -lt $deadline) {
+            if ($process.HasExited) { throw "GUI exited before interactive: $($process.ExitCode)" }
+            if (Test-Path $trace) {
+              foreach ($line in Get-Content -LiteralPath $trace) {
+                try {
+                  if (($line | ConvertFrom-Json).phase -eq 'interactive') {
+                    $interactive = $true
+                    break
+                  }
+                } catch {
+                  # The writer may still be appending the final JSONL record; the next poll retries it.
+                }
+              }
+              if ($interactive) { break }
+            }
+            Start-Sleep -Milliseconds 200
+          }
+          Remove-Item Env:DSH_STARTUP_TRACE
+          if (-not $interactive) { throw "GUI did not report an interactive control within 60s" }
+          Stop-Process -Id $process.Id -Force
           Start-Process -FilePath (Join-Path $dir 'uninstall.exe') -ArgumentList '/S' -Wait
           if (Test-Path $dir) { throw "uninstaller left $dir behind" }
 

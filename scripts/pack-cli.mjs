@@ -5,13 +5,15 @@
  * The launcher has the payload (Node + dsh closure) appended by the
  * build-payload bin, so the artifact is one self-contained file.
  *
- * Usage: node scripts/pack-cli.mjs [--win|--linux]
+ * Usage: node scripts/pack-cli.mjs [--win|--linux] [--skip-prepare]
+ * Pre-pack: checks official DeepSeek Harness, syncs npm payload if needed,
+ * then increments the desktop suffix (official 0.1.0-rc.7 → 0.1.0-rc.7.1).
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { VERSION } from './config.mjs'
+import { readDesktopVersion } from './desktop-version.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const plat = process.argv.includes('--linux') ? 'linux' : 'win'
@@ -30,6 +32,13 @@ const run = (cmd, args, label, opts = {}) => {
 const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const runNpm = (args, label) => run(npmCmd, args, label, { shell: process.platform === 'win32' })
 
+if (!process.argv.includes('--skip-prepare')) {
+  const prepareArgs = ['scripts/sync-and-bump.mjs']
+  if (process.argv.includes('--skip-sync')) prepareArgs.push('--skip-sync')
+  if (process.argv.includes('--skip-bump')) prepareArgs.push('--skip-bump')
+  run(process.execPath, prepareArgs, 'sync official payload and bump version')
+}
+
 // Stale CLI artifacts from earlier versions must not linger.
 mkdirSync(join(root, 'dist'), { recursive: true })
 for (const name of readdirSync(join(root, 'dist'))) {
@@ -38,13 +47,14 @@ for (const name of readdirSync(join(root, 'dist'))) {
 
 runNpm(['ci'], 'install pinned payload deps')
 run(process.execPath, ['scripts/prepare-payload.mjs', plat], 'stage payload')
+run(process.execPath, ['scripts/verify-payload.mjs', plat], 'verify payload')
 
 const crateDir = join(root, 'crates', 'dsh-cli')
 run('cargo', ['build', '--release'], 'build launcher', { cwd: crateDir })
 const launcher = join(crateDir, 'target', 'release', plat === 'win' ? 'dsh-cli.exe' : 'dsh-cli')
 if (!existsSync(launcher)) throw new Error('pack-cli: launcher binary missing after cargo build')
 
-const out = join(root, 'dist', `dsh-cli-${VERSION}-${plat}-x64${plat === 'win' ? '.exe' : ''}`)
+const out = join(root, 'dist', `dsh-cli-${readDesktopVersion()}-${plat}-x64${plat === 'win' ? '.exe' : ''}`)
 run(
   'cargo',
   ['run', '--release', '--bin', 'build-payload', '--', join(root, '.work', `payload-${plat}`), launcher, out],

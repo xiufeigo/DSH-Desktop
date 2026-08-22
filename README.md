@@ -28,22 +28,22 @@ GUI（Windows）                     CLI（Windows / Linux）
 ┌─ Tauri 壳（Rust，约 8 MB）────┐     ┌─ Rust 启动器（几百 KB）────────────┐
 │  起内置 dsh web → 开窗口    │     │  首启解压内置载荷到缓存 → exec node  │
 └────────────────────────────┘     └─ 载荷：zstd 压缩后追加在二进制尾部 ──┘
-                 共享载荷：内置 Node 官方运行时 + @deepseek-ai/dsh 依赖闭包
-                 + @deepseek-ai/dsh-web-frontend/dist（npm 发布版，pin 死版本）
+                 共享载荷：精简 Node 官方运行时 + @deepseek-ai/dsh 依赖闭包
+                 + dsh-web-app 解析出的兼容 Web 前端
 ```
 
 - CLI 二进制布局：`[启动器代码][tar.zst 载荷][footer(魔数+偏移+sha256)]`；首启校验哈希后解压到 `%LOCALAPPDATA%\dsh-cli\<hash>`（Windows）或 `~/.cache/dsh-cli/<hash>`（Linux），以内容哈希为键，升级后自动换新缓存目录。
 - GUI 安装布局：`payload/{node,app,THIRD_PARTY_NOTICES.txt,LICENSE}` 随 NSIS 安装到应用目录，启动时由 Tauri 壳拉起 dsh web 并打开 WebView2 窗口。
-- 载荷基于 **pin 死的 npm 发布版**：dsh 直接作为应用的**生产依赖**安装（`package.json` 的 dependencies），打包时按 `npm ls` 生产闭包复制进载荷，剔除 `.map`/`.d.ts`/测试目录。
+- 载荷基于 **pin 死的 npm 发布版**：只有 dsh 作为应用的直接生产依赖；Web 前端版本由 `dsh-web-app` 决定。打包时按 `npm ls` 复制生产闭包，只保留 Node 可执行文件与许可证，并剔除类型声明、source map、PDB、测试目录和非目标架构的 `node-pty` 预编译产物。
 - dsh 是 developer preview，接口会变：每个 DSH Desktop 版本对应一个固定的 dsh 版本。
 
 ## 同步上游（DeepSeek Harness 更新）
 
-载荷版本只有一个事实来源：`package.json` 的 dependencies（`@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-web-frontend`，后者版本体系独立）。
+载荷版本只有一个事实来源：`package.json` 的 `@deepseek-ai/dsh` 直接依赖。`@deepseek-ai/dsh-web-frontend` 不直接 pin，由 `dsh-web-app` 选择兼容版本；同步脚本和 CI 会验证依赖树中只有这一套前端。
 
 - **手动（一条命令）**：`node scripts/update-dsh.mjs` — 自动查 npm 最新版、精确 pin、重装、验证闭包并冒烟 `dsh --version`；随后本地出包，或直接推 `v*` tag 让 CI 出全平台产物。
-- **自动**：`.github/workflows/update.yml` 每周一检查上游，有新版自动开 PR（`chore: sync DeepSeek Harness payload`）；合并 PR 后推 `v*` tag 即触发 `release.yml` 发布。
-- 建议：dsh 是 developer preview，跨版本可能有破坏性变更；发版前本地跑一遍 `dsh-cli --version` + `dsh-cli web` 冒烟。
+- **自动**：`.github/workflows/update.yml` 每周一检查上游，有新版自动开 PR；PR 必须通过 Windows/Linux 的依赖树、payload、CLI、Web 和原生模块冒烟后才能合并。
+- dsh 是 developer preview，跨版本可能有破坏性变更；不要绕过同步 PR 的冒烟检查。
 
 ## 构建
 
@@ -59,12 +59,11 @@ node scripts/pack-gui.mjs            # Windows GUI 安装程序 → dist/DSH-Des
 
 ## 已知行为与限制
 
-- **CLI 首次运行**：需要把载荷解压到缓存目录（约 290 MB、近两万个小文件），通常十几秒（Windows Defender 实时扫描占大头），仅此一次；后续运行秒开。删除缓存目录不影响功能，下次运行会重新解压。
+- **CLI 首次运行**：需要把载荷解压到缓存目录（当前 Windows 载荷约 210 MiB、1.49 万个文件），Windows Defender 会扫描这些文件；仅首次解压发生。删除缓存目录不影响功能，下次运行会重新解压。
 - **GUI 依赖系统 WebView2**：Win10/11 家用版自带；LTSC/Server/精简版可能没有，启动时会弹窗给出下载地址，装好后即可用。
 - **SmartScreen**：v1 尚未做代码签名，首次运行安装程序/二进制时 Windows 可能提示"仍要运行"，点"更多信息 → 仍要运行"放行即可；代码签名已列入后续计划。
 - **自动更新**：v1 暂未内置；升级即替换文件（`$DSH_HOME` 数据不受影响）。
-- **体积**：GUI 安装程序约 50 MB，CLI 单二进制约 66 MB。
-- **日志**：GUI 模式后端日志在 `%APPDATA%/dsh-desktop/logs/dsh-web.log`，排障时先看这里。
+- **日志**：GUI 模式后端日志在 `%APPDATA%/dsh-desktop/logs/dsh-web.log`。设置 `DSH_STARTUP_TRACE=1` 后，启动阶段耗时写入同目录的 `startup-trace.jsonl`；默认不创建 trace。
 
 ## 目录
 
@@ -72,20 +71,22 @@ node scripts/pack-gui.mjs            # Windows GUI 安装程序 → dist/DSH-Des
 crates/dsh-cli/                   CLI 单二进制启动器（自解压 + exec node + 载荷追加打包器）
 crates/dsh-gui/                   GUI Tauri v2 壳（spawn dsh web + WebView2 窗口 + 单实例 + 缺失提示）
 scripts/prepare-payload.mjs       载荷准备：生产闭包复制 + 瘦身 + 许可证材料
+scripts/verify-payload.mjs        载荷契约、Node/CLI/Web/node-pty 冒烟
 scripts/pack-cli.mjs / pack-gui.mjs  打包编排
 scripts/collect-notices.mjs       许可证审计：生成载荷内 THIRD_PARTY_NOTICES.txt（含 LGPL 补充）
 scripts/collect-rust-licenses.mjs  Rust 依赖审计：生成 build/rust-licenses.txt（486 crate + 许可证全文）
 scripts/update-dsh.mjs            上游同步：一键升级 dsh 载荷并验证
 scripts/fetch-node.mjs            Node 运行时下载
-scripts/make-icons.mjs            图标生成（零依赖）
+scripts/make-icons.mjs            从 DeepSeek SVG 生成多尺寸应用图标
 .github/workflows/release.yml     全平台构建与发布（Windows：GUI + CLI；Linux：CLI）
+.github/workflows/ci.yml          上游同步 PR 的 Windows/Linux 兼容性门禁
 .github/workflows/update.yml      每周自动同步上游（开 PR）
 ```
 
 ## 许可证与合规
 
 - **本项目代码**：MIT（仓库 `LICENSE`）。**内置 DeepSeek Harness**：MIT（Copyright DeepSeek）；Web 前端 `@deepseek-ai/dsh-web-frontend` 为 BSD-3-Clause——均为宽松许可证。
-- **载荷依赖树已程序化审计**（`scripts/collect-notices.mjs`，构建时自动生成随产物分发的 `THIRD_PARTY_NOTICES.txt`）：当前生产闭包共 580 个包、均有明确许可证声明，其中 579 个为宽松许可证（MIT / ISC / Apache-2.0 / BSD-2/3-Clause / 0BSD / PSF），无 GPL/AGPL/MPL/EPL 等强 copyleft；各包的 LICENSE 文件随包完整分发。
+- **载荷依赖树已程序化审计**（`scripts/collect-notices.mjs`，构建时自动生成随产物分发的 `THIRD_PARTY_NOTICES.txt`）：当前生产闭包共 523 个包；各包的许可证声明与随包许可证文本会写入产物。
 - **唯一的弱 copyleft 例外**：`@img/sharp-win32-x64`（经 sharp → dsh-attachment-local 引入，用于附件图片处理）声明 `Apache-2.0 AND LGPL-3.0-or-later`——sharp 本体为 Apache-2.0，其内置的 libvips 为 LGPL-2.1-or-later，以**独立 DLL 动态链接、未作修改随包分发**，符合 LGPL 再分发要求；该包自身只附 Apache 文本，`collect-notices.mjs` 会自动把 LGPL-3.0 全文（`build/licenses/LGPL-3.0.txt`）补进 THIRD_PARTY_NOTICES.txt。
 - **运行时随附各自的许可证**：Node.js（`payload/node/LICENSE`）；GUI 的 WebView2 由 Microsoft 随系统提供，不随本包分发。
 - **Rust 依赖**：dsh-gui / dsh-cli 静态链接的 486 个 crate 已程序化审计（`scripts/collect-rust-licenses.mjs` → `build/rust-licenses.txt`，随产物分发）：全部为宽松许可证（MIT / Apache-2.0 / BSD-3-Clause / ISC / Zlib / Unicode-3.0），5 个 MPL-2.0（文件级弱 copyleft，未作修改、源码即 crates.io 原包）与 r-efi（三许可，本项目选择 MIT）；无 GPL/AGPL/EPL。

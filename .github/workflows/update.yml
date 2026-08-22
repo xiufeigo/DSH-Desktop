@@ -29,12 +29,13 @@ jobs:
       - name: Open pull request
         uses: peter-evans/create-pull-request@v7
         with:
-          title: 'chore: sync DeepSeek Harness payload'
+          title: 'chore: 同步 DeepSeek Harness 载荷'
           branch: sync/dsh-payload
-          commit-message: 'chore: sync @deepseek-ai/dsh payload to latest'
+          commit-message: 'chore: 同步 @deepseek-ai/dsh 到最新版本'
           body: |
-            Automated upstream sync: `@deepseek-ai/dsh` and `@deepseek-ai/dsh-web-frontend`
-            bumped to their latest npm releases.
+            Automated upstream sync: `@deepseek-ai/dsh` bumped to its latest npm
+            release. The compatible `@deepseek-ai/dsh-web-frontend` version is
+            resolved from `dsh-web-app` and validated by the payload CI matrix.
 
             Merging does NOT publish artifacts — cut a `v*` tag afterwards to
             trigger `release.yml` for all platforms.
