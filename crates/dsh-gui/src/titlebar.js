@@ -68,8 +68,10 @@
   const STORAGE_KEY = 'dsh-gui.sidebar-tint-v2'
   const FONT_COOKIE = 'dsh_gui_fonts_v1'
   const FONT_STORAGE = 'dsh-gui.fonts-v1'
-  const NOTIFY_COOKIE = 'dsh_gui_notify_v1'
-  const NOTIFY_STORAGE = 'dsh-gui.notify-v1'
+  const NOTIFY_COOKIE = 'dsh_gui_notify_v2'
+  const NOTIFY_STORAGE = 'dsh-gui.notify-v2'
+  const NOTIFY_LEGACY_COOKIE = 'dsh_gui_notify_v1'
+  const NOTIFY_LEGACY_STORAGE = 'dsh-gui.notify-v1'
   const DEFAULT_EN_FONT = 'Segoe UI'
   const DEFAULT_ZH_FONT = 'Microsoft YaHei'
   const DEFAULT_CODE_FONT = 'Consolas'
@@ -77,6 +79,36 @@
   const DETAILS_WIDTH_KEY = 'dsh-explorer:details-width'
   const LATIN_RANGE = 'U+0000-024F,U+1E00-1EFF,U+2000-218F,U+2190-21FF,U+2200-22FF'
   const CJK_RANGE = 'U+2E80-9FFF,U+F900-FAFF,U+FE10-FE1F,U+FE30-FE4F,U+FF00-FFEF,U+20000-2FA1F'
+  // 提示音清单：与 scripts/make-audio.mjs 的 GROUPS 及 audio.js 内嵌资源一一
+  // 对应，选项分组/命名沿用 opencode（MIT）。中文标签也照搬 opencode zh。
+  const SOUND_GROUPS = [
+    { prefix: 'alert-', count: 10, en: 'Alert', zh: '警报' },
+    { prefix: 'bip-bop-', count: 10, en: 'Bip-bop', zh: null },
+    { prefix: 'staplebops-', count: 7, en: 'Staplebops', zh: null },
+    { prefix: 'nope-', count: 12, en: 'Nope', zh: null },
+    { prefix: 'yup-', count: 6, en: 'Yup', zh: null },
+  ]
+  const NOTIFY_DEFAULTS = {
+    notifications: { agent: true, permissions: true, errors: false },
+    sounds: {
+      agentEnabled: true,
+      agent: 'staplebops-01',
+      permissionsEnabled: true,
+      permissions: 'staplebops-02',
+      errorsEnabled: true,
+      errors: 'nope-03',
+    },
+  }
+  const SOUND_CHANNELS = [
+    { key: 'agent', copy: 'soundAgent' },
+    { key: 'permissions', copy: 'soundPermissions' },
+    { key: 'errors', copy: 'soundErrors' },
+  ]
+  const NOTIFY_CHANNELS = [
+    { key: 'agent', copy: 'notifyAgent' },
+    { key: 'permissions', copy: 'notifyPermissions' },
+    { key: 'errors', copy: 'notifyErrors' },
+  ]
   const FONT_PROBES = [
     'Segoe UI', 'Segoe UI Variable Text', 'Aptos', 'Calibri', 'Arial', 'Tahoma',
     'Verdana', 'Georgia', 'Times New Roman', 'Cambria', 'Trebuchet MS', 'Bahnschrift',
@@ -115,7 +147,7 @@
   let resizeTimer = null
   let currentTint = TINT_DEFAULT
   let currentFonts = { en: '', zh: '', code: '' }
-  let currentNotify = true
+  let currentNotify = clonePrefs(NOTIFY_DEFAULTS)
   let fontFamilyCache = null
   let watching = false
   let settingsSyncRaf = 0
@@ -133,6 +165,18 @@
       Promise.resolve(internals.invoke(command, { label: windowLabel() })).catch(function () {})
     } catch (_error) {
       /* window commands are best-effort */
+    }
+  }
+
+  function tauriInvoke(command, args) {
+    const internals = window.__TAURI_INTERNALS__
+    if (!internals || typeof internals.invoke !== 'function') {
+      return Promise.reject(new Error('tauri unavailable'))
+    }
+    try {
+      return Promise.resolve(internals.invoke(command, args || {}))
+    } catch (error) {
+      return Promise.reject(error)
     }
   }
 
@@ -244,28 +288,112 @@
     }
   }
 
+  // —— 通知/提示音偏好（v2 JSON）。与 notify.js 的 sanitizePrefs 保持同一
+  // schema：两个脚本各自内联一份，改字段时必须两边同步。
+  function clonePrefs(prefs) {
+    return {
+      notifications: { ...prefs.notifications },
+      sounds: { ...prefs.sounds },
+    }
+  }
+
+  function soundIdKnown(value) {
+    if (typeof value !== 'string') return false
+    const table = window.__DSH_GUI_AUDIO__
+    if (!table) return SOUND_IDS().indexOf(value) !== -1
+    return Object.prototype.hasOwnProperty.call(table, value)
+  }
+
+  function SOUND_IDS() {
+    const ids = []
+    for (const group of SOUND_GROUPS) {
+      for (let n = 1; n <= group.count; n += 1) {
+        ids.push(group.prefix + String(n).padStart(2, '0'))
+      }
+    }
+    return ids
+  }
+
+  function sanitizeNotifyPrefs(value) {
+    const source = value && typeof value === 'object' ? value : {}
+    const notifications = source.notifications && typeof source.notifications === 'object' ? source.notifications : {}
+    const sounds = source.sounds && typeof source.sounds === 'object' ? source.sounds : {}
+    const bool = (input) => (typeof input === 'boolean' ? input : null)
+    const id = (input) => (soundIdKnown(input) ? input : null)
+    const merged = clonePrefs(NOTIFY_DEFAULTS)
+    for (const key of Object.keys(merged.notifications)) {
+      const parsed = bool(notifications[key])
+      if (parsed !== null) merged.notifications[key] = parsed
+    }
+    for (const key of Object.keys(merged.sounds)) {
+      if (key.endsWith('Enabled')) {
+        const parsed = bool(sounds[key])
+        if (parsed !== null) merged.sounds[key] = parsed
+      } else {
+        const parsed = id(sounds[key])
+        if (parsed !== null) merged.sounds[key] = parsed
+      }
+    }
+    return merged
+  }
+
   function readStoredNotify() {
     const cookie = readCookie(NOTIFY_COOKIE)
-    if (cookie === '0') return false
-    if (cookie === '1') return true
+    if (cookie) {
+      try {
+        return sanitizeNotifyPrefs(JSON.parse(decodeURIComponent(cookie)))
+      } catch (_error) {
+        /* malformed cookie */
+      }
+    }
     try {
       const stored = localStorage.getItem(NOTIFY_STORAGE)
-      if (stored === '0') return false
-      if (stored === '1') return true
+      if (stored) return sanitizeNotifyPrefs(JSON.parse(stored))
     } catch (_error) {
       /* private mode / blocked storage */
     }
-    return true
+    // v1 单开关迁移：明确关过通知的用户，三个通知通道全部默认关。
+    let legacy = readCookie(NOTIFY_LEGACY_COOKIE)
+    if (legacy === null) {
+      try {
+        const stored = localStorage.getItem(NOTIFY_LEGACY_STORAGE)
+        if (stored !== null) legacy = stored
+      } catch (_error) {
+        /* private mode / blocked storage */
+      }
+    }
+    if (legacy === '0') {
+      const migrated = clonePrefs(NOTIFY_DEFAULTS)
+      migrated.notifications = { agent: false, permissions: false, errors: false }
+      return migrated
+    }
+    return clonePrefs(NOTIFY_DEFAULTS)
   }
 
-  function persistNotify(enabled) {
-    currentNotify = Boolean(enabled)
-    const value = currentNotify ? '1' : '0'
-    writeCookie(NOTIFY_COOKIE, value)
+  function persistNotify(prefs) {
+    currentNotify = sanitizeNotifyPrefs(prefs)
+    const encoded = encodeURIComponent(JSON.stringify(currentNotify))
+    writeCookie(NOTIFY_COOKIE, encoded)
     try {
-      localStorage.setItem(NOTIFY_STORAGE, value)
+      localStorage.setItem(NOTIFY_STORAGE, JSON.stringify(currentNotify))
     } catch (_error) {
       /* private mode / blocked storage */
+    }
+  }
+
+  // 试听：与 notify.js 的 playSound 相同的播放路径；失败静默（自动播放
+  // 已在 main.rs 通过 WebView2 启动参数放行）。
+  function previewSound(soundId) {
+    if (!soundId) return
+    try {
+      const table = window.__DSH_GUI_AUDIO__
+      const src = table && Object.prototype.hasOwnProperty.call(table, soundId) ? table[soundId] : null
+      if (!src) return
+      const audio = new Audio(src)
+      const played = audio.play()
+      if (played && typeof played.catch === 'function') played.catch(function () {})
+    } catch (_error) {
+      /* preview is best-effort */
     }
   }
 
@@ -482,6 +610,14 @@
       '#' + SETTINGS_PANEL_ID + ' input[type=text]{box-sizing:border-box;width:100%;height:36px;margin:0;padding:0 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-module-platform,transparent);color:var(--dsw-alias-label-primary);font:inherit;outline:none}',
       '#' + SETTINGS_PANEL_ID + ' input[type=text]:focus{border-color:var(--dsw-static-neutral-bluish-400,#4c8dff)}',
       '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-reset{align-self:flex-start;margin:0;padding:0;border:0;background:transparent;color:var(--dsw-static-neutral-bluish-400,#137c6b);font:inherit;font-size:12px;line-height:18px;cursor:pointer}',
+      '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-apply{align-self:flex-start;margin:4px 0 0;padding:7px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-module-platform,transparent);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:18px;cursor:pointer}',
+      '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-apply:hover{border-color:var(--dsw-static-neutral-bluish-400,#137c6b)}',
+      '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-apply:disabled{opacity:.55;cursor:default}',
+      '#' + SETTINGS_PANEL_ID + ' input[type=text]:disabled{opacity:.55}',
+      '#' + SETTINGS_PANEL_ID + ' select.dsh-gui-settings-select{box-sizing:border-box;width:100%;height:36px;margin:0;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-module-platform,transparent);color:var(--dsw-alias-label-primary);font:inherit;outline:none;cursor:pointer}',
+      '#' + SETTINGS_PANEL_ID + ' select.dsh-gui-settings-select:focus{border-color:var(--dsw-static-neutral-bluish-400,#4c8dff)}',
+      '#' + SETTINGS_PANEL_ID + ' select.dsh-gui-settings-select option{background:var(--dsw-alias-bg-base,#f9fafb);color:var(--dsw-alias-label-primary,#1a1a1e)}',
+      'body[data-ds-dark-theme] #' + SETTINGS_PANEL_ID + ' select.dsh-gui-settings-select{color-scheme:dark}',
       '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-check{align-items:flex-start;gap:8px;display:flex;cursor:pointer;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}',
       '#' + SETTINGS_PANEL_ID + ' .dsh-gui-settings-check input{flex:none;margin:3px 0 0;accent-color:var(--dsw-static-neutral-bluish-400,#137c6b)}',
     ].join('\n')
@@ -612,8 +748,33 @@
         fontHint: 'Leave blank for the system default. English and Chinese fonts apply to different scripts.',
         placeholder: 'System default',
         reset: 'Reset fonts',
-        notify: 'Desktop notifications',
-        notifyHint: 'When the window is in the background: session finished, approval needed, or a question to answer.',
+        notifySection: 'System notifications',
+        notifyAgent: 'Agent',
+        notifyAgentHint: 'Show a system notification when the agent completes or needs attention.',
+        notifyPermissions: 'Permissions',
+        notifyPermissionsHint: 'Show a system notification when an approval or answer is needed.',
+        notifyErrors: 'Errors',
+        notifyErrorsHint: 'Show a system notification when an error occurs.',
+        soundSection: 'Sound effects',
+        soundAgent: 'Agent',
+        soundAgentHint: 'Play a sound when the agent completes or needs attention.',
+        soundPermissions: 'Permissions',
+        soundPermissionsHint: 'Play a sound when an approval or answer is needed.',
+        soundErrors: 'Errors',
+        soundErrorsHint: 'Play a sound when an error occurs.',
+        soundNone: 'None',
+        proxyTitle: 'Network proxy',
+        proxyEnable: 'Enable proxy (this app only)',
+        proxyUrl: 'Proxy URL',
+        proxyNoProxy: 'Bypass list (NO_PROXY)',
+        proxyNoProxyHint: 'Comma-separated hosts that skip the proxy. Blank uses localhost,127.0.0.1,::1.',
+        proxyApply: 'Save',
+        proxyApplyWarn: 'Applies immediately to new connections — no restart needed.',
+        proxyActiveOn: 'Traffic is going through: %s',
+        proxyPending: 'Proxy on.',
+        proxyOff: 'Direct connection (no proxy).',
+        applying: 'Saving…',
+        proxyError: 'Failed: ',
       }
     }
     return {
@@ -626,8 +787,33 @@
       fontHint: '留空则使用系统默认。英文字体作用于西文，中文字体作用于汉字。',
       placeholder: '系统默认',
       reset: '恢复默认字体',
-      notify: '桌面通知',
-      notifyHint: '窗口在后台时：会话结束、需要审批、或需要你回答，会弹出系统通知。',
+      notifySection: '系统通知',
+      notifyAgent: '智能体',
+      notifyAgentHint: '当智能体完成或需要注意时显示系统通知。',
+      notifyPermissions: '权限',
+      notifyPermissionsHint: '当需要审批或需要你回答时显示系统通知。',
+      notifyErrors: '错误',
+      notifyErrorsHint: '发生错误时显示系统通知。',
+      soundSection: '音效',
+      soundAgent: '智能体',
+      soundAgentHint: '当智能体完成或需要注意时播放提示音。',
+      soundPermissions: '权限',
+      soundPermissionsHint: '当需要审批或需要你回答时播放提示音。',
+      soundErrors: '错误',
+      soundErrorsHint: '发生错误时播放提示音。',
+      soundNone: '无',
+      proxyTitle: '网络代理',
+      proxyEnable: '启用代理（仅 DSH 生效）',
+      proxyUrl: '代理地址',
+      proxyNoProxy: '直连例外（NO_PROXY）',
+      proxyNoProxyHint: '逗号分隔、不走代理的主机；留空默认 localhost,127.0.0.1,::1。',
+      proxyApply: '保存',
+      proxyApplyWarn: '新连接即时生效，无需重启。',
+      proxyActiveOn: '流量正经过：%s',
+      proxyPending: '代理已开启。',
+      proxyOff: '未启用——当前直连。',
+      applying: '正在保存…',
+      proxyError: '失败：',
     }
   }
 
@@ -728,27 +914,121 @@
     tintRow.appendChild(tintHint)
     panel.appendChild(tintRow)
 
-    const notifyRow = document.createElement('div')
-    notifyRow.className = 'dsh-gui-settings-row'
-    const notifyLabel = document.createElement('label')
-    notifyLabel.className = 'dsh-gui-settings-check'
-    const notifyBox = document.createElement('input')
-    notifyBox.type = 'checkbox'
-    notifyBox.checked = currentNotify
-    notifyBox.setAttribute('aria-label', copy.notify)
-    notifyBox.addEventListener('change', function () {
-      persistNotify(notifyBox.checked)
-    })
-    const notifyName = document.createElement('span')
-    notifyName.textContent = copy.notify
-    notifyLabel.appendChild(notifyBox)
-    notifyLabel.appendChild(notifyName)
-    const notifyHint = document.createElement('p')
-    notifyHint.className = 'dsh-gui-settings-hint'
-    notifyHint.textContent = copy.notifyHint
-    notifyRow.appendChild(notifyLabel)
-    notifyRow.appendChild(notifyHint)
-    panel.appendChild(notifyRow)
+    // —— 系统通知 / 音效：三个通道沿用 opencode 的语义（agent=回合完成、
+    // permissions=审批/提问、errors=出错），偏好由 notify.js 消费；音效资源
+    // 由 audio.js 以 data URI 内嵌，选择即试听。
+    const notifyHeading = document.createElement('div')
+    notifyHeading.className = 'dsh-gui-settings-title'
+    notifyHeading.textContent = copy.notifySection
+    panel.appendChild(notifyHeading)
+
+    function checkChannelRow(labelText, hintText, checked, onChange) {
+      const row = document.createElement('div')
+      row.className = 'dsh-gui-settings-row'
+      const label = document.createElement('label')
+      label.className = 'dsh-gui-settings-check'
+      const box = document.createElement('input')
+      box.type = 'checkbox'
+      box.checked = Boolean(checked)
+      box.setAttribute('aria-label', labelText)
+      box.addEventListener('change', function () {
+        onChange(box.checked)
+      })
+      const name = document.createElement('span')
+      name.textContent = labelText
+      label.appendChild(box)
+      label.appendChild(name)
+      const hint = document.createElement('p')
+      hint.className = 'dsh-gui-settings-hint'
+      hint.textContent = hintText
+      row.appendChild(label)
+      row.appendChild(hint)
+      return row
+    }
+
+    for (const channel of NOTIFY_CHANNELS) {
+      panel.appendChild(checkChannelRow(
+        copy[channel.copy],
+        copy[channel.copy + 'Hint'],
+        currentNotify.notifications[channel.key],
+        function (checked) {
+          const next = clonePrefs(currentNotify)
+          next.notifications[channel.key] = checked
+          persistNotify(next)
+        },
+      ))
+    }
+
+    const soundHeading = document.createElement('div')
+    soundHeading.className = 'dsh-gui-settings-title'
+    soundHeading.textContent = copy.soundSection
+    panel.appendChild(soundHeading)
+
+    function soundOptionLabel(group, index) {
+      const number = String(index).padStart(2, '0')
+      const base = group.zh || group.en
+      return base + ' ' + number
+    }
+
+    function soundChoices() {
+      const choices = [{ value: '', label: copy.soundNone }]
+      for (const group of SOUND_GROUPS) {
+        for (let n = 1; n <= group.count; n += 1) {
+          const value = group.prefix + String(n).padStart(2, '0')
+          choices.push({ value: value, label: soundOptionLabel(group, n) })
+        }
+      }
+      return choices
+    }
+
+    const soundChoicesCache = soundChoices()
+
+    function soundSelectRow(key, labelText, hintText) {
+      const row = document.createElement('div')
+      row.className = 'dsh-gui-settings-row'
+      const label = document.createElement('div')
+      label.className = 'dsh-gui-settings-label'
+      label.textContent = labelText
+      const select = document.createElement('select')
+      select.className = 'dsh-gui-settings-select'
+      select.setAttribute('aria-label', labelText)
+      for (const choice of soundChoicesCache) {
+        const option = document.createElement('option')
+        option.value = choice.value
+        option.textContent = choice.label
+        select.appendChild(option)
+      }
+      const enabled = Boolean(currentNotify.sounds[key + 'Enabled'])
+      const current = String(currentNotify.sounds[key] || '')
+      select.value = enabled && current ? current : ''
+      select.addEventListener('change', function () {
+        const next = clonePrefs(currentNotify)
+        if (select.value === '') {
+          // 选「无」= 关闭该通道（保留记忆的音效，重新勾选时恢复）。
+          next.sounds[key + 'Enabled'] = false
+        } else {
+          next.sounds[key + 'Enabled'] = true
+          next.sounds[key] = select.value
+          previewSound(select.value)
+        }
+        persistNotify(next)
+      })
+      const hint = document.createElement('p')
+      hint.className = 'dsh-gui-settings-hint'
+      hint.textContent = hintText
+      row.appendChild(label)
+      row.appendChild(select)
+      row.appendChild(hint)
+      return row
+    }
+
+    for (const channel of SOUND_CHANNELS) {
+      panel.appendChild(soundSelectRow(
+        channel.key,
+        copy[channel.copy],
+        copy[channel.copy + 'Hint'],
+      ))
+    }
 
     const list = document.createElement('datalist')
     list.id = FONT_LIST_ID
@@ -794,13 +1074,145 @@
     reset.addEventListener('click', function () {
       persistFonts({ en: '', zh: '', code: '' })
       applyFonts(currentFonts)
-      const inputs = panel.querySelectorAll('input[type=text]')
+      // 只清字体输入框；面板里的其它文本输入（如网络代理地址）不能被顺手清空。
+      const inputs = panel.querySelectorAll('input[type=text][list="' + FONT_LIST_ID + '"]')
       for (let i = 0; i < inputs.length; i += 1) {
         inputs[i].value = ''
         inputs[i].style.fontFamily = ''
       }
     })
     panel.appendChild(reset)
+
+    // —— 网络代理：wrapper 层偏好，保存到 %APPDATA%\dsh-desktop\settings.json。
+    // 后端环境固定指向 GUI 内置的本地中继(127.0.0.1 随机端口)，这里保存后
+    // 由 Rust 端热切换中继上游——新连接立即生效，无需重启后端；只影响本
+    // 应用及其子进程（插件 / session / 工具调用），不写系统全局环境。
+    const proxyHeading = document.createElement('div')
+    proxyHeading.className = 'dsh-gui-settings-title'
+    proxyHeading.textContent = copy.proxyTitle
+    panel.appendChild(proxyHeading)
+
+    let proxySaved = null
+    let proxyActiveUrl = null
+    let proxyLoaded = false
+
+    const enableRow = document.createElement('div')
+    enableRow.className = 'dsh-gui-settings-row'
+    const enableLabel = document.createElement('label')
+    enableLabel.className = 'dsh-gui-settings-check'
+    const proxyBox = document.createElement('input')
+    proxyBox.type = 'checkbox'
+    proxyBox.disabled = true
+    proxyBox.setAttribute('aria-label', copy.proxyEnable)
+    const enableName = document.createElement('span')
+    enableName.textContent = copy.proxyEnable
+    enableLabel.appendChild(proxyBox)
+    enableLabel.appendChild(enableName)
+    enableRow.appendChild(enableLabel)
+    panel.appendChild(enableRow)
+
+    function proxyTextRow(labelText, placeholderText) {
+      const row = document.createElement('div')
+      row.className = 'dsh-gui-settings-row'
+      const label = document.createElement('div')
+      label.className = 'dsh-gui-settings-label'
+      label.textContent = labelText
+      const input = document.createElement('input')
+      input.type = 'text'
+      input.placeholder = placeholderText
+      input.setAttribute('spellcheck', 'false')
+      input.setAttribute('autocomplete', 'off')
+      input.setAttribute('aria-label', labelText)
+      input.disabled = true
+      row.appendChild(label)
+      row.appendChild(input)
+      panel.appendChild(row)
+      return input
+    }
+
+    const proxyUrlInput = proxyTextRow(copy.proxyUrl, 'http://127.0.0.1:7897')
+    const proxyBypassInput = proxyTextRow(copy.proxyNoProxy, 'localhost,127.0.0.1,::1')
+
+    const bypassHint = document.createElement('p')
+    bypassHint.className = 'dsh-gui-settings-hint'
+    bypassHint.textContent = copy.proxyNoProxyHint
+    panel.appendChild(bypassHint)
+
+    const proxyStatus = document.createElement('p')
+    proxyStatus.className = 'dsh-gui-settings-hint'
+    panel.appendChild(proxyStatus)
+
+    const proxyApply = document.createElement('button')
+    proxyApply.type = 'button'
+    proxyApply.className = 'dsh-gui-settings-apply'
+    proxyApply.textContent = copy.proxyApply
+    proxyApply.disabled = true
+    panel.appendChild(proxyApply)
+
+    const applyWarn = document.createElement('p')
+    applyWarn.className = 'dsh-gui-settings-hint'
+    applyWarn.textContent = copy.proxyApplyWarn
+    panel.appendChild(applyWarn)
+
+    function syncProxyControls() {
+      const on = proxyBox.checked
+      proxyUrlInput.disabled = !on || !proxyLoaded
+      proxyBypassInput.disabled = !on || !proxyLoaded
+      proxyApply.disabled = !proxyLoaded
+    }
+
+    function proxyStatusText() {
+      if (!proxyLoaded) return ''
+      if (proxyActiveUrl) return copy.proxyActiveOn.replace('%s', proxyActiveUrl)
+      if (proxySaved && proxySaved.enabled) return copy.proxyPending
+      return copy.proxyOff
+    }
+
+    proxyBox.addEventListener('change', syncProxyControls)
+
+    proxyApply.addEventListener('click', function () {
+      if (proxyApply.disabled) return
+      proxyApply.disabled = true
+      proxyStatus.textContent = copy.applying
+      tauriInvoke('set_proxy_settings', {
+        enabled: proxyBox.checked,
+        url: proxyUrlInput.value.trim(),
+        noProxy: proxyBypassInput.value.trim(),
+      })
+        .then(function () {
+          // 保存即热切换；回读一次让状态行立刻反映当前出口。
+          return tauriInvoke('get_proxy_settings')
+        })
+        .then(function (state) {
+          if (panel.isConnected && state) {
+            proxySaved = state.saved || {}
+            proxyActiveUrl = state.activeUrl || null
+            proxyStatus.textContent = proxyStatusText()
+          }
+          proxyApply.disabled = false
+        })
+        .catch(function (error) {
+          proxyStatus.textContent =
+            copy.proxyError + String((error && error.message) || error || '')
+          proxyApply.disabled = false
+        })
+    })
+
+    tauriInvoke('get_proxy_settings').then(function (state) {
+      if (!panel.isConnected || !state) return
+      proxySaved = state.saved || {}
+      proxyActiveUrl = state.activeUrl || null
+      proxyLoaded = true
+      proxyBox.checked = Boolean(proxySaved.enabled)
+      proxyUrlInput.value = String(proxySaved.url || '')
+      proxyBypassInput.value = String(proxySaved.noProxy || '')
+      syncProxyControls()
+      proxyStatus.textContent = proxyStatusText()
+    }, function () {
+      if (!panel.isConnected) return
+      proxyStatus.textContent = copy.proxyError + 'get_proxy_settings'
+    })
+
     return panel
   }
 

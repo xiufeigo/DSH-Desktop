@@ -1,12 +1,13 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.1-rc.2.1",
+  "version": "0.1.1-rc.2.4",
   "description": "DSH Desktop — 第三方开发的 DeepSeek Harness 桌面/命令行包装：Tauri GUI（Windows）+ 单二进制 CLI（Windows/Linux）",
   "license": "MIT",
   "private": true,
   "author": "DSH Desktop contributors",
   "scripts": {
     "icons": "node scripts/make-icons.mjs",
+    "audio": "node scripts/make-audio.mjs",
     "pack": "node scripts/pack-cli.mjs",
     "pack:cli": "node scripts/pack-cli.mjs",
     "pack:cli:linux": "node scripts/pack-cli.mjs --linux",

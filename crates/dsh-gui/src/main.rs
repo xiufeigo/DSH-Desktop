@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod relay;
+mod settings;
 mod startup;
 
 use std::fs::{self, File};
@@ -22,6 +24,13 @@ use tauri_plugin_notification::NotificationExt;
 use std::os::windows::process::CommandExt;
 
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
+// 本地转发中继：后端环境里的代理地址永远指向它；上游指向(Clash/直连)
+// 由 RELAY_TARGET 持有，改设置即时切换，无需重启后端。
+static RELAY_TARGET: OnceLock<relay::RelayTarget> = OnceLock::new();
+static RELAY_PORT: AtomicU16 = AtomicU16::new(0);
+// 当前实际生效的出口(Some=经该地址转发,None=直连),供设置面板展示。
+static ACTIVE_URL: Mutex<Option<String>> = Mutex::new(None);
+static RESTARTING: AtomicBool = AtomicBool::new(false);
 static STARTUP_TRACE: OnceLock<StartupTrace> = OnceLock::new();
 static INTERACTIVE_REPORTED: AtomicBool = AtomicBool::new(false);
 static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
@@ -113,6 +122,78 @@ fn show_desktop_notification(app: tauri::AppHandle, title: String, body: String)
         .title(&title)
         .body(&body)
         .show();
+}
+
+/// Proxy preferences as saved on disk plus the LIVE egress (`active_url` is
+/// null for direct). Thanks to the local relay, `active_url` tracks saves
+/// immediately — no restart involved.
+#[tauri::command]
+fn get_proxy_settings() -> serde_json::Value {
+    let saved = settings::load_proxy();
+    let active = ACTIVE_URL.lock().unwrap().clone();
+    serde_json::json!({
+        "saved": saved,
+        "activeUrl": active,
+    })
+}
+
+/// Validate + persist + hot-apply. The relay swaps its upstream atomically,
+/// so the next connection from the backend (or any plugin/session/tool child)
+/// already uses the new value.
+#[tauri::command]
+fn set_proxy_settings(enabled: bool, url: String, no_proxy: String) -> Result<(), String> {
+    let entry = settings::ProxySettings {
+        enabled,
+        url,
+        no_proxy,
+    };
+    if enabled && entry.effective().is_none() {
+        return Err("代理地址无效：需要 http:// 或 https:// 开头的完整地址（例如 http://127.0.0.1:7897）".to_string());
+    }
+    settings::save_proxy(&entry)?;
+    let live = entry.effective().map(|effective| effective.url);
+    if let Some(target) = RELAY_TARGET.get() {
+        target.set(live.clone());
+    }
+    *ACTIVE_URL.lock().unwrap() = live;
+    Ok(())
+}
+
+/// Kill the dsh web process and respawn it with the freshly saved settings,
+/// then reuse the normal readiness wait + navigation flow. Sessions running
+/// under the old backend die with it — the panel says so before invoking.
+#[tauri::command]
+fn restart_backend(app: tauri::AppHandle) -> Result<(), String> {
+    if RESTARTING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("后端正在重启中，请稍候".to_string());
+    }
+    trace_startup("backend_restart_requested", None);
+    kill_server();
+    match spawn_server() {
+        Ok((child, endpoint)) => {
+            *SERVER.lock().unwrap() = Some(child);
+            trace_startup("server_spawned", Some("restart"));
+            let app_handle = app;
+            let spawned = std::thread::Builder::new()
+                .name("dsh-restart-readiness".to_string())
+                .spawn(move || {
+                    finish_startup(app_handle, endpoint);
+                    RESTARTING.store(false, Ordering::SeqCst);
+                });
+            spawned.map_err(|error| {
+                RESTARTING.store(false, Ordering::SeqCst);
+                format!("无法启动就绪检测线程：{error}")
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            RESTARTING.store(false, Ordering::SeqCst);
+            Err(format!("无法启动 DSH 后端：{error}"))
+        }
+    }
 }
 
 fn kill_server() {
@@ -294,6 +375,39 @@ fn spawn_server() -> std::io::Result<(Child, Receiver<Result<u16, startup::WaitR
     let stdout_log = File::create(dir.join("dsh-web.log"))?;
     let stderr = stdout_log.try_clone()?;
     let mut cmd = Command::new(node_binary());
+    // 代理走本地中继：环境变量只写一次、永远指向 127.0.0.1 的 relay 端口；
+    // 上游(Clash 地址或直连)由 GUI 进程持有并可热切换，改设置不用重启后端。
+    // 中继万一没起来，退回老行为——把真实地址静态注入。
+    let saved = settings::load_proxy();
+    let bypass = if saved.no_proxy.trim().is_empty() {
+        settings::DEFAULT_NO_PROXY.to_string()
+    } else {
+        saved.no_proxy.trim().to_string()
+    };
+    let relay_port = RELAY_PORT.load(Ordering::Acquire);
+    let applied: Option<String> = if relay_port != 0 {
+        let url = format!("http://127.0.0.1:{relay_port}");
+        for (name, value) in [
+            ("HTTP_PROXY", url.clone()),
+            ("http_proxy", url.clone()),
+            ("HTTPS_PROXY", url.clone()),
+            ("https_proxy", url.clone()),
+            ("NO_PROXY", bypass.clone()),
+            ("no_proxy", bypass),
+            ("NODE_USE_ENV_PROXY", "1".to_string()),
+        ] {
+            cmd.env(name, value);
+        }
+        Some(url)
+    } else if saved.apply_to(&mut cmd) {
+        Some(saved.url.trim().trim_end_matches('/').to_string())
+    } else {
+        None
+    };
+    *ACTIVE_URL.lock().unwrap() = applied.clone();
+    if let Some(url) = &applied {
+        trace_startup("proxy_enabled", Some(url));
+    }
     // GUI 程序没有控制台；不给 console 子系统的 node 子进程分配新控制台，
     // 否则每次启动都会闪一个黑色 cmd 窗口。
     #[cfg(windows)]
@@ -540,7 +654,10 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             startup_interactive,
-            show_desktop_notification
+            show_desktop_notification,
+            get_proxy_settings,
+            set_proxy_settings,
+            restart_backend
         ])
         .setup(|app| {
             #[cfg(windows)]
@@ -548,6 +665,24 @@ fn main() {
                 trace_startup("startup_failed", Some("WebView2 runtime missing"));
                 show_webview2_missing();
                 std::process::exit(2);
+            }
+
+            // 先起本地中继，后端环境才能在 spawn 时指向它（热加载的根基）。
+            let saved_proxy = settings::load_proxy();
+            let relay_target = relay::RelayTarget::new(if saved_proxy.enabled {
+                Some(saved_proxy.url.clone())
+            } else {
+                None
+            });
+            match relay::spawn(relay_target.clone()) {
+                Ok(port) => {
+                    RELAY_PORT.store(port, Ordering::Release);
+                    let _ = RELAY_TARGET.set(relay_target);
+                    trace_startup("relay_listening", Some(&format!("port={port}")));
+                }
+                Err(error) => {
+                    trace_startup("relay_failed", Some(&error.to_string()));
+                }
             }
 
             let endpoint = match spawn_server() {
@@ -581,8 +716,19 @@ fn main() {
                     // WebView2 默认白底会把 CSS 透明像素合成回实白，亚克力
                     // 透不出来。alpha=0 才走窗口材质。
                     .background_color(Color(0, 0, 0, 0))
+                    // 提示音在后台事件（回合结束/待审批）时触发，没有用户手势；
+                    // WebView2 默认的自动播放策略会拦截这类带声音的播放，这里
+                    // 显式放行。仅 Windows 生效（其余平台不支持、自动忽略），
+                    // 并保留 wry 默认的 disable-features 参数。
+                    .additional_browser_args(
+                        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                         --autoplay-policy=no-user-gesture-required",
+                    )
                     .initialization_script(include_str!("titlebar.js"))
-                    // 会话通知：见 notify.js。
+                    // 提示音资源（opencode MIT 音效，data URI 内嵌）：见 audio.js，
+                    // 必须先于 notify.js 注入，供其按设置播放。
+                    .initialization_script(include_str!("audio.js"))
+                    // 会话通知 + 提示音：见 notify.js。
                     .initialization_script(include_str!("notify.js"))
                     // 剪贴板写兜底：见 clipboard.js。
                     .initialization_script(include_str!("clipboard.js"))

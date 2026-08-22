@@ -13,8 +13,19 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+pub mod proxy;
+
+/// Inject the wrapper-owned proxy preference into a dsh child command (same
+/// settings.json the GUI reads; see [`proxy`] for the contract). Returns
+/// whether a proxy was applied.
+pub fn configure_proxy(cmd: &mut Command) -> bool {
+    let entry = proxy::load_proxy();
+    entry.apply_to(cmd)
+}
 
 pub const MAGIC: &[u8; 16] = b"DSHCLIPAYLOAD001";
 pub const FOOTER_LEN: u64 = 16 + 8 + 64;

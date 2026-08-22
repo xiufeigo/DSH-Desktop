@@ -1,11 +1,12 @@
 [package]
 name = "dsh-cli"
-version = "0.1.1-rc.2.1"
+version = "0.1.1-rc.2.4"
 edition = "2021"
 description = "DSH Desktop CLI — single-binary launcher for DeepSeek Harness with embedded Node + payload"
 license = "MIT"
 
 [dependencies]
+serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 zstd = "0.13"

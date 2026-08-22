@@ -19,6 +19,33 @@ dsh-cli-<ver>-win-x64.exe       # 直接运行 dsh 原生命令行（--version /
 dsh-cli-<ver>-linux-x64         # chmod +x 后即可运行
 ```
 
+## 网络代理（仅对 DSH 生效，GUI 热生效）
+
+DSH 本体是纯 Node 进程：既不读 Windows"系统代理"（注册表），全局 `fetch` 默认也不理会 `HTTP_PROXY`/`HTTPS_PROXY`（Node ≥24 需要 `NODE_USE_ENV_PROXY=1` 才启用）；而它的 `.env` 加载器把这几个代理变量列为 bootstrap-only、只认**启动方注入的环境**。因此桌面版把代理做成 wrapper 自己的设置：
+
+- **GUI**：设置 → 通用设置 → **桌面 → 网络代理**。填地址（如 `http://127.0.0.1:7897`）、勾选启用、点保存——**即时生效，无需重启**。
+- **热生效原理**：GUI 启动时在本地起一个转发中继（127.0.0.1 随机端口），后端环境的代理地址固定指向中继；GUI 内部持有真实上游（Clash 地址或直连），保存即原子切换，新连接立刻走新出口。后端、插件、session、工具调用全部无感跟随。
+- **CLI**：单次启动型进程，每次运行读取最新配置并直接注入真实代理地址（天然就是新配置），与 GUI 共享同一份 settings.json。
+- **作用范围**：环境变量只注入 dsh 进程树，**不写用户/系统全局环境变量，不影响其它程序**。
+- **实际注入**：`HTTP_PROXY` / `http_proxy` / `HTTPS_PROXY` / `https_proxy` / `NO_PROXY` / `no_proxy` / `NODE_USE_ENV_PROXY=1`。直连例外留空时默认 `localhost,127.0.0.1,::1`。
+- **配置文件**（GUI 与 CLI 共享，可手改）：
+  - Windows：`%APPDATA%\dsh-desktop\settings.json`
+  - Linux（CLI）：`$XDG_CONFIG_HOME/dsh-desktop/settings.json`（默认 `~/.config/...`）
+  - 格式：`{"proxy":{"enabled":true,"url":"http://127.0.0.1:7897","noProxy":""}}`
+- 只接受 `http://` / `https://` 代理（HTTP CONNECT 隧道；Clash/v2rayN 等的混合端口直接可用）。文件损坏或字段缺失按"未启用"处理，不会阻塞启动。中继不可用时自动退回静态注入的老行为。
+
+## 会话通知与提示音（GUI）
+
+窗口在后台也能掌握回合状态。设置 → 通用设置 → **桌面**，语义对齐 [opencode](https://github.com/anomalyco/opencode)：
+
+- **系统通知**：三个独立开关
+  - 智能体——回合完成时弹系统通知（默认开）
+  - 权限——需要审批或需要你回答时弹系统通知（默认开）
+  - 错误——回合出错时弹系统通知（默认关）
+- **音效**：同样的三个通道各配一个提示音，共 45 种内置音效（取自 opencode，MIT，见 `crates/dsh-gui/audio/README.md`）。下拉选择即试听，选「无」关闭该通道；默认与 opencode 一致（Staplebops 01 / Staplebops 02 / Nope 03）。
+- 窗口在前台时不重复弹通知卡片（任务栏闪烁照常），提示音则按各自开关独立触发；WebView2 自动播放已由启动参数放行。
+- 偏好保存在 WebView 的 cookie + localStorage（`dsh_gui_notify_v2` JSON）；旧版单开关 `dsh_gui_notify_v1` 关闭过的用户迁移后默认全关。
+
 ## 原理
 
 DSH 本体基于 Node.js 并已发布到 npm（原生模块均带预编译产物，用户无需编译）。桌面版把它"装箱"：
@@ -68,8 +95,8 @@ node scripts/pack-gui.mjs            # Windows GUI 安装程序 → dist/DSH-Des
 ## 目录
 
 ```
-crates/dsh-cli/                   CLI 单二进制启动器（自解压 + exec node + 载荷追加打包器）
-crates/dsh-gui/                   GUI Tauri v2 壳（spawn dsh web + WebView2 窗口 + 单实例 + 缺失提示）
+crates/dsh-cli/                   CLI 单二进制启动器（自解压 + exec node + 载荷追加打包器；proxy.rs 注入代理环境）
+crates/dsh-gui/                   GUI Tauri v2 壳（spawn dsh web + WebView2 窗口 + 单实例 + 缺失提示；settings.rs 代理偏好 + 设置面板注入）
 scripts/prepare-payload.mjs       载荷准备：生产闭包复制 + 瘦身 + 许可证材料
 scripts/verify-payload.mjs        载荷契约、Node/CLI/Web/node-pty 冒烟
 scripts/pack-cli.mjs / pack-gui.mjs  打包编排
@@ -78,6 +105,7 @@ scripts/collect-rust-licenses.mjs  Rust 依赖审计：生成 build/rust-license
 scripts/update-dsh.mjs            上游同步：一键升级 dsh 载荷并验证
 scripts/fetch-node.mjs            Node 运行时下载
 scripts/make-icons.mjs            从 DeepSeek SVG 生成多尺寸应用图标
+scripts/make-audio.mjs            把 crates/dsh-gui/audio 的提示音内嵌为 src/audio.js（data URI）
 .github/workflows/release.yml     全平台构建与发布（Windows：GUI + CLI；Linux：CLI）
 .github/workflows/ci.yml          上游同步 PR 的 Windows/Linux 兼容性门禁
 .github/workflows/update.yml      每周自动同步上游（开 PR）
@@ -89,6 +117,7 @@ scripts/make-icons.mjs            从 DeepSeek SVG 生成多尺寸应用图标
 - **载荷依赖树已程序化审计**（`scripts/collect-notices.mjs`，构建时自动生成随产物分发的 `THIRD_PARTY_NOTICES.txt`）：当前生产闭包共 523 个包；各包的许可证声明与随包许可证文本会写入产物。
 - **唯一的弱 copyleft 例外**：`@img/sharp-win32-x64`（经 sharp → dsh-attachment-local 引入，用于附件图片处理）声明 `Apache-2.0 AND LGPL-3.0-or-later`——sharp 本体为 Apache-2.0，其内置的 libvips 为 LGPL-2.1-or-later，以**独立 DLL 动态链接、未作修改随包分发**，符合 LGPL 再分发要求；该包自身只附 Apache 文本，`collect-notices.mjs` 会自动把 LGPL-3.0 全文（`build/licenses/LGPL-3.0.txt`）补进 THIRD_PARTY_NOTICES.txt。
 - **运行时随附各自的许可证**：Node.js（`payload/node/LICENSE`）；GUI 的 WebView2 由 Microsoft 随系统提供，不随本包分发。
+- **提示音素材**：45 个音效复制自 opencode（MIT，Copyright opencode），以 data URI 内嵌进 GUI 二进制，出处与许可见 `crates/dsh-gui/audio/README.md`。
 - **Rust 依赖**：dsh-gui / dsh-cli 静态链接的 486 个 crate 已程序化审计（`scripts/collect-rust-licenses.mjs` → `build/rust-licenses.txt`，随产物分发）：全部为宽松许可证（MIT / Apache-2.0 / BSD-3-Clause / ISC / Zlib / Unicode-3.0），5 个 MPL-2.0（文件级弱 copyleft，未作修改、源码即 crates.io 原包）与 r-efi（三许可，本项目选择 MIT）；无 GPL/AGPL/EPL。
 - **商标与命名**：DeepSeek 为 DeepSeek 公司的商标。本项目是基于其开源 Harness 的社区桌面封装，与官方无隶属关系；名称仅用于指代所基于的项目。产品名采用 DSH Desktop，以区别于官方 DeepSeek 品牌。
 - 若发现许可证信息有遗漏或疑问，欢迎提 issue 指正。

@@ -15,6 +15,9 @@
     "core:window:allow-internal-toggle-maximize",
     "clipboard:allow-write-text",
     "allow-startup-interactive",
-    "allow-show-desktop-notification"
+    "allow-show-desktop-notification",
+    "allow-get-proxy-settings",
+    "allow-set-proxy-settings",
+    "allow-restart-backend"
   ]
 }
