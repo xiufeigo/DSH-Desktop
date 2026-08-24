@@ -10,7 +10,10 @@ import {
 import { extname, join, relative } from 'node:path'
 
 export const PAYLOAD_LIMITS = Object.freeze({
-  bytes: 225 * 1024 * 1024,
+  // Linux 载荷天然比 Windows 大：sharp/node-pty/koffi 等原生模块要同时带
+  // glibc 与 musl 变体。上游闭包增长曾把 Linux 推过 225 MiB（v0.1.1-rc.2.4
+  // 的发布作业因此失败），256 MiB 给后续增长留出余量。
+  bytes: 256 * 1024 * 1024,
   files: 15_000,
 })
 

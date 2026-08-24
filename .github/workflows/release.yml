@@ -43,20 +43,23 @@ jobs:
       - name: Pack CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: node scripts/pack-cli.mjs --win
+        # tag 提交即版本事实来源：CI 不做同步、不再递增后缀，保证产物名与
+        # tag 一致（此前 pack-cli 与 pack-gui 各自 bump，tag .4 出过 .5/.6）。
+        # 上游有更新时由每周 update.yml 开 PR 走正常发版流程。
+        run: node scripts/pack-cli.mjs --win --skip-sync --skip-bump
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pack GUI installer (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: node scripts/pack-gui.mjs
+        run: node scripts/pack-gui.mjs --skip-sync --skip-bump
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pack CLI (Linux)
         if: runner.os == 'Linux'
-        run: node scripts/pack-cli.mjs --linux
+        run: node scripts/pack-cli.mjs --linux --skip-sync --skip-bump
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

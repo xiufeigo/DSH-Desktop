@@ -23,6 +23,15 @@
  * plumbing is involved; WebView2 autoplay is unlocked via additional browser
  * args in main.rs because these events fire without a user gesture.
  *
+ * Everything the watcher sees is one rendered frame of ONE session, so the
+ * sidebar's active-session text (sessionStamp) scopes all state: on a stamp
+ * change pending timers are cancelled, running/dedupe state resets, and
+ * whatever is already on screen becomes a silent baseline — switching
+ * sessions never fires anything by itself (bugfix: leaving a generating
+ * session used to look like "turn finished" because the stop button
+ * vanished). Approval/question keys stay remembered per session so toggling
+ * away and back does not re-ping for the same card.
+ *
  * Prefs live in the same cookie/localStorage pair the Settings → Desktop panel
  * (titlebar.js) writes: `dsh_gui_notify_v2` JSON, migrated from the v1 single
  * switch. Both scripts must agree on the schema — see sanitizePrefs() here and
@@ -53,13 +62,19 @@
     },
   })
 
+  // 所有信号都是当前渲染出来的 DOM：切会话 = 整个世界换了一帧。watchStamp
+  // 记录正在观察的会话；一旦变化就清空运行态/去重基线/待触发定时器，把新
+  // 会话屏幕上已有的一切当历史静默基线，绝不补发。
+  let watchStamp = ''
+  let errorBaseline = 0
   let seenRunning = false
+  // 去重 key 按会话记忆：卡片从 DOM 消失不清标记（切走再切回不重发），
+  // 同会话出现不同 key 才再次提醒；仅会话切换时重置。
   let lastApproval = ''
   let lastQuestion = ''
   let completeTimer = null
   let completeStamp = ''
   let completeBaseErrors = -1
-  let errorWatch = { stamp: '', count: 0 }
   let errorTimer = null
   let pollRaf = 0
   let watching = false
@@ -264,18 +279,18 @@
     return copy ? clip(copy.textContent) : ''
   }
 
-  function queueError(stamp) {
+  function queueError() {
     if (errorTimer !== null) return
     errorTimer = setTimeout(function () {
       errorTimer = null
-      // Re-read: the errored rows may have vanished (session switch) while
-      // the debounce was pending.
+      // 定时器只在同会话内存活（切会话即取消）；期间卡片消失（如历史
+      // 重载）就安静放弃。
       if (errorRowCount() === 0) return
       if (completeTimer !== null) {
         clearTimeout(completeTimer)
         completeTimer = null
       }
-      send('error', latestErrorText() || (stamp ? clip(stamp) : ''))
+      send('error', latestErrorText())
     }, ERROR_DEBOUNCE_MS)
   }
 
@@ -299,16 +314,30 @@
   function tick() {
     const state = readState()
 
-    // Terminal turn failure: fire when a NEW TurnErrorItem card appears in
-    // the session currently being viewed. A stamp change (or the count
-    // dropping, e.g. history reload) rebaselines silently instead of
-    // replaying old failures for every session you visit.
-    if (state.stamp !== errorWatch.stamp || state.errors < errorWatch.count) {
-      errorWatch.stamp = state.stamp
-      errorWatch.count = state.errors
-    } else if (state.errors > errorWatch.count) {
-      errorWatch.count = state.errors
-      queueError(state.stamp)
+    // 会话切换：新会话屏幕上的一切（历史错误卡、旧审批卡）都只是基线，
+    // 静默记录后直接返回，等下一帧再开始观察——切换本身绝不触发任何提醒。
+    // 唯一带过桥的状态是新会话"正在生成"：切入后它结束时仍要报完成。
+    if (state.stamp !== watchStamp) {
+      watchStamp = state.stamp
+      errorBaseline = state.errors
+      seenRunning = state.running === true
+      lastApproval = ''
+      lastQuestion = ''
+      if (completeTimer !== null) {
+        clearTimeout(completeTimer)
+        completeTimer = null
+      }
+      if (errorTimer !== null) {
+        clearTimeout(errorTimer)
+        errorTimer = null
+      }
+      return
+    }
+
+    // 终态回合失败：同一会话内出现新的 TurnErrorItem 卡片才提醒。
+    if (state.errors > errorBaseline) {
+      errorBaseline = state.errors
+      queueError()
     }
 
     if (state.approvalKey && state.approvalKey !== lastApproval) {
@@ -318,8 +347,6 @@
         completeTimer = null
       }
       send('approval', state.approvalBody)
-    } else if (!state.approvalKey) {
-      lastApproval = ''
     }
 
     if (state.questionKey && state.questionKey !== lastQuestion) {
@@ -329,8 +356,6 @@
         completeTimer = null
       }
       send('question', state.questionBody)
-    } else if (!state.questionKey) {
-      lastQuestion = ''
     }
 
     if (state.running) {
@@ -350,6 +375,7 @@
     completeTimer = setTimeout(function () {
       completeTimer = null
       const later = readState()
+      // 定时器只在同会话内存活（切换时已取消），这里仅防按钮闪断。
       if (later.running) {
         seenRunning = true
         return
