@@ -16,3 +16,6 @@ crates/dsh-gui/icons/
 # stray pnpm artifacts (repo builds with npm ci)
 pnpm-lock.yaml
 pnpm-workspace.yaml
+
+# agent harness runtime state
+.omo/
