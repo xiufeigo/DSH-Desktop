@@ -13,6 +13,8 @@
     "pack:cli:linux": "node scripts/pack-cli.mjs --linux",
     "pack:gui": "node scripts/pack-gui.mjs",
     "sync:upstream": "node scripts/update-dsh.mjs",
+    "harness:patch": "pwsh -NoProfile -File scripts/apply-patches.ps1",
+    "harness:frontend": "node scripts/inject-local-frontend.mjs",
     "test": "node --test scripts/payload-contract.test.mjs",
     "verify:payload": "node scripts/verify-payload.mjs"
   },

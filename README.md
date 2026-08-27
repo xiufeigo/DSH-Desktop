@@ -44,6 +44,7 @@ DSH 本体是纯 Node 进程：既不读 Windows"系统代理"（注册表），
   - 错误——回合出错时弹系统通知（默认关）
 - **音效**：同样的三个通道各配一个提示音，共 45 种内置音效（取自 opencode，MIT，见 `crates/dsh-gui/audio/README.md`）。下拉选择即试听，选「无」关闭该通道；默认与 opencode 一致（Staplebops 01 / Staplebops 02 / Nope 03）。
 - 窗口在前台时不重复弹通知卡片（任务栏闪烁照常），提示音则按各自开关独立触发；WebView2 自动播放已由启动参数放行。
+- 通知观察**按会话划分**：切走正在生成的会话不会被误判成「回合完成」而误报；审批/提问卡按会话记忆去重——切回不重发，出现新卡才再次提醒；错误卡只在同一会话内有新增时触发。
 - 偏好保存在 WebView 的 cookie + localStorage（`dsh_gui_notify_v2` JSON）；旧版单开关 `dsh_gui_notify_v1` 关闭过的用户迁移后默认全关。
 
 ## 原理
@@ -69,8 +70,36 @@ GUI（Windows）                     CLI（Windows / Linux）
 载荷版本只有一个事实来源：`package.json` 的 `@deepseek-ai/dsh` 直接依赖。`@deepseek-ai/dsh-web-frontend` 不直接 pin，由 `dsh-web-app` 选择兼容版本；同步脚本和 CI 会验证依赖树中只有这一套前端。
 
 - **手动（一条命令）**：`node scripts/update-dsh.mjs` — 自动查 npm 最新版、精确 pin、重装、验证闭包并冒烟 `dsh --version`；随后本地出包，或直接推 `v*` tag 让 CI 出全平台产物。
+- **版本规则与打包闸门**：桌面版号 = 官方 dsh 版本 + 本地打包后缀（官方 `0.1.0-rc.7` → 桌面 `0.1.0-rc.7.1`）。每个 `pack-cli` / `pack-gui` 步骤开头都会跑 `scripts/sync-and-bump.mjs`：先查上游、有新版则同步载荷，再递增打包后缀；`--skip-sync` / `--skip-bump` 可分别跳过两步。
+- **发布即 tag**：CI 的三个打包步骤均带 `--skip-sync --skip-bump`——tag 提交就是版本的唯一事实来源，产物名与 tag 严格一致（此前曾在 CI 内被连 bump 两次导致产物版本漂移）；上游更新只走每周 `update.yml` 的 PR 流程。
 - **自动**：`.github/workflows/update.yml` 每周一检查上游，有新版自动开 PR；PR 必须通过 Windows/Linux 的依赖树、payload、CLI、Web 和原生模块冒烟后才能合并。
 - dsh 是 developer preview，跨版本可能有破坏性变更；不要绕过同步 PR 的冒烟检查。
+
+### deepseek-harness 源码补丁（patches/）
+
+个别优化以上游源码补丁的形式维护在本仓库，每次同步/升级 deepseek-harness 之后重放一次即可（幂等）：
+
+```sh
+npm run harness:patch                 # 实际应用全部补丁
+pwsh scripts/apply-patches.ps1 -Check # 只看会做什么，不改文件
+```
+
+| 补丁 | 说明 |
+| --- | --- |
+| `deepseek-harness-markdown-settled-cache.patch` | 给 `MarkdownText` 的 settled 渲染加 40 条 LRU 缓存：切回超长会话时已完成消息不再整批重新解析 GFM/KaTeX |
+
+- 补丁插入点极小、上下文锚定明确，跨版本大概率直接合上；合不上时脚本会用 `--3way` 兜底，仍失败则落 `.reject` 文件，人工手贴那几行后提交。
+- **本地立即生效链路**（免等上游发版）：补丁进检出后本地重建前端并注入载荷预编译 dist：
+
+  ```sh
+  pwsh scripts/apply-patches.ps1        # 1) 补丁合入 deepseek-harness 检出（幂等）
+  # 2) 在 harness 检出里重建：pnpm run build:lib:client && pnpm run build:web
+  npm run harness:frontend              # 3) 注入仓库 node_modules 与已安装 GUI 的 dist
+  ```
+
+  注入脚本先扫描新产物 sourcemap、确认包含补丁标记（`renderSettledCached`）才落盘；首次注入自动把上游原版备份为同级 `dist.upstream-bak`。重启 DSH shell 生效；`node scripts/inject-local-frontend.mjs --restore` 一键回到上游版本，`--status` 查看各处指纹。注入版自带 sourcemap 便于 DevTools 定位——打安装器时 prepare-payload 会按既有规则剔除 .map，不影响发布体积契约。
+
+- **出包已自动携带**：`pack-cli` / `pack-gui` 在 `npm ci` 之后、生产闭包复制之前会跑 `scripts/ensure-local-frontend.mjs` 重放上面的注入（幂等），所以只要本机补丁+检出+构建产物齐备，正常打包命令无需任何额外动作；本机没有检出时（如 GitHub runner）自动警告放行官方前端，显式跳过传 `--skip-local-frontend`。
 
 ## 构建
 
@@ -82,11 +111,11 @@ node scripts/pack-cli.mjs --linux    # Linux CLI（必须在 Linux 上跑）
 node scripts/pack-gui.mjs            # Windows GUI 安装程序 → dist/DSH-Desktop-Setup-<ver>.exe
 ```
 
-需要 Rust 工具链（stable）；NSIS 由 tauri-bundler 自动获取。构建步骤由 `pack-cli.mjs` / `pack-gui.mjs` 编排：`npm ci` → `prepare-payload.mjs`（Node 运行时 + 生产闭包 + 瘦身 + 许可证材料）→ cargo 构建 → 载荷追加 / tauri-bundler NSIS。CI 已按原生矩阵排好：推 tag `v*` 或手动触发 `.github/workflows/release.yml`，自动产出 Windows GUI 安装程序 + CLI exe、Linux CLI 单二进制并挂到 Release。
+需要 Rust 工具链（stable）；NSIS 由 tauri-bundler 自动获取。构建步骤由 `pack-cli.mjs` / `pack-gui.mjs` 编排：`sync-and-bump.mjs` 打包前闸门（本地默认查上游并递增后缀；CI 发布传 `--skip-sync --skip-bump`）→ `npm ci` → `ensure-local-frontend.mjs` 补丁前端闸门（仓库维护 `patches/` 且本机有 deepseek-harness 检出构建产物时，自动把打补丁的前端重新注入刚被 npm ci 还原的官方载荷；无检出环境如 CI 自动放行官方流）→ `prepare-payload.mjs`（Node 运行时 + 生产闭包 + 瘦身 + 许可证材料）→ cargo 构建 → 载荷追加 / tauri-bundler NSIS。CI 已按原生矩阵排好：推 tag `v*` 或手动触发 `.github/workflows/release.yml`，自动产出 Windows GUI 安装程序 + CLI exe、Linux CLI 单二进制并挂到 Release。
 
 ## 已知行为与限制
 
-- **CLI 首次运行**：需要把载荷解压到缓存目录（当前 Windows 载荷约 210 MiB、1.49 万个文件），Windows Defender 会扫描这些文件；仅首次解压发生。删除缓存目录不影响功能，下次运行会重新解压。
+- **CLI 首次运行**：需要把载荷解压到缓存目录（当前 Windows 载荷约 193 MiB、约 1.3 万个文件；Linux 约 233 MiB——sharp/node-pty/koffi 等原生模块需同时带 glibc 与 musl 变体），Windows Defender 会扫描这些文件；仅首次解压发生。删除缓存目录不影响功能，下次运行会重新解压。打包契约对载荷设了 **256 MiB / 15000 文件**上限，超限即构建失败，防体积失控。
 - **GUI 依赖系统 WebView2**：Win10/11 家用版自带；LTSC/Server/精简版可能没有，启动时会弹窗给出下载地址，装好后即可用。
 - **SmartScreen**：v1 尚未做代码签名，首次运行安装程序/二进制时 Windows 可能提示"仍要运行"，点"更多信息 → 仍要运行"放行即可；代码签名已列入后续计划。
 - **自动更新**：v1 暂未内置；升级即替换文件（`$DSH_HOME` 数据不受影响）。
@@ -103,6 +132,15 @@ scripts/pack-cli.mjs / pack-gui.mjs  打包编排
 scripts/collect-notices.mjs       许可证审计：生成载荷内 THIRD_PARTY_NOTICES.txt（含 LGPL 补充）
 scripts/collect-rust-licenses.mjs  Rust 依赖审计：生成 build/rust-licenses.txt（486 crate + 许可证全文）
 scripts/update-dsh.mjs            上游同步：一键升级 dsh 载荷并验证
+scripts/sync-and-bump.mjs         打包前闸门：查上游→按需同步→递增桌面包后缀（--skip-sync/--skip-bump）
+scripts/apply-patches.ps1         补丁重放：升级 harness 后把 patches/ 合入其源码检出（幂等，-Check 试运行）
+scripts/inject-local-frontend.mjs 本地前端注入：sourcemap 校验 + 自动备份/回滚，覆盖 repo 与已安装 GUI 的 dist
+scripts/ensure-local-frontend.mjs 打包含丁前端闸门：npm ci 后自动重注入补丁版前端（CI 无检出时放行官方流）
+patches/deepseek-harness-markdown-settled-cache.patch  本地源码补丁：会话消息 settled 渲染 LRU 缓存（性能）
+scripts/desktop-version.mjs       桌面版号规则：官方 dsh 版本 + 本地打包后缀
+scripts/config.mjs                共享打包配置：APP_ID / VERSION 常量、Node 渠道与镜像源
+scripts/payload-contract.mjs      载荷契约：256 MiB / 15000 文件上限等常量（配套 .test.mjs，npm test）
+scripts/benchmark-windows.ps1     Windows 安装程序启动基准测试
 scripts/fetch-node.mjs            Node 运行时下载
 scripts/make-icons.mjs            从 DeepSeek SVG 生成多尺寸应用图标
 scripts/make-audio.mjs            把 crates/dsh-gui/audio 的提示音内嵌为 src/audio.js（data URI）

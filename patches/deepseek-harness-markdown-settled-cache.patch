@@ -1,0 +1,58 @@
+diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
+--- a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
++++ b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
+@@ -25,6 +25,45 @@ import css from './MarkdownText.module.css'
+ 
+ export type { MarkdownCodeLabels, MarkdownFileMentions } from './render.tsx'
+ 
++/**
++ * Settled renders are a pure function of (text, codeLabels, fileMentions),
++ * but they re-parse the entire reply (GFM + KaTeX) whenever a finished
++ * message remounts — switching back to a long session re-renders every
++ * message and pays that cost for all of them at once. Memoize the last N
++ * settled results as an LRU keyed by the exact inputs; a hit skips parse
++ * and render entirely. Cached elements remain safe to share across
++ * messages because an equal key implies identical inputs, so handlers
++ * baked into those elements observe exactly what their original render
++ * observed.
++ */
++const SETTLED_CACHE_LIMIT = 40
++
++const settledCache = new Map<string, ReactNode[]>()
++
++/** Last-N LRU memoization over {@link renderSettled}, keyed by its inputs. */
++function renderSettledCached(
++  text: string,
++  codeLabels: MarkdownCodeLabels | undefined,
++  fileMentions: MarkdownFileMentions | undefined,
++): ReactNode[] {
++  const key = JSON.stringify([text, codeLabels, fileMentions])
++  const fresh = settledCache.get(key)
++  if (fresh !== undefined) {
++    settledCache.delete(key)
++    settledCache.set(key, fresh)
++    return fresh
++  }
++  const children = renderSettled(text, codeLabels, fileMentions)
++  if (settledCache.size >= SETTLED_CACHE_LIMIT) {
++    for (const oldest of settledCache.keys()) {
++      settledCache.delete(oldest)
++      break
++    }
++  }
++  settledCache.set(key, children)
++  return children
++}
++
+ /** One settled full render: parse with math, resolve references, append the footnote section. */
+ function renderSettled(
+   text: string,
+@@ -164,7 +203,7 @@ export const MarkdownText = memo(function MarkdownText({ text, streaming = false
+   const children = useMemo(() => {
+     if (!streaming) {
+       streamRef.current = null
+-      return renderSettled(text, codeLabels, fileMentions)
++      return renderSettledCached(text, codeLabels, fileMentions)
+     }
+     if (streamRef.current === null || streamLabelsRef.current !== codeLabels) {
+       streamRef.current = new StreamingRenderer(codeLabels)

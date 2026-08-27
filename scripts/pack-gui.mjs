@@ -5,9 +5,10 @@
  * dsh closure + notices) under payload/, so both products share one payload
  * preparation pipeline.
  *
- * Usage: node scripts/pack-gui.mjs [--skip-prepare]
+ * Usage: node scripts/pack-gui.mjs [--skip-prepare] [--skip-sync] [--skip-bump] [--skip-local-frontend]
  * Pre-pack: checks official DeepSeek Harness, syncs npm payload if needed,
- * then increments the desktop suffix (official 0.1.0-rc.7 → 0.1.0-rc.7.1).
+ * re-injects the locally patched web frontend when available, then increments
+ * the desktop suffix (official 0.1.0-rc.7 → 0.1.0-rc.7.1).
  */
 import { spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
@@ -43,6 +44,11 @@ for (const name of readdirSync(join(root, 'dist'))) {
 }
 
 runNpm(['ci'], 'install pinned payload deps')
+// 打包规则第 4 步：npm ci 还原了官方前端——若仓库维护 harness 源码补丁且本机有
+// 对应构建产物，则在生产闭包复制前重新注入（详见 README「deepseek-harness 源码补丁」）。
+if (!process.argv.includes('--skip-local-frontend')) {
+  run(process.execPath, ['scripts/ensure-local-frontend.mjs'], 'ensure patched local frontend')
+}
 run(process.execPath, ['scripts/prepare-payload.mjs', 'win'], 'stage payload')
 run(process.execPath, ['scripts/verify-payload.mjs', 'win'], 'verify payload')
 
