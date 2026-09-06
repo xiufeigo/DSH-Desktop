@@ -19,6 +19,16 @@ dsh-cli-<ver>-win-x64.exe       # 直接运行 dsh 原生命令行（--version /
 dsh-cli-<ver>-linux-x64         # chmod +x 后即可运行
 ```
 
+## 后端运行环境（GUI：Windows 原生 vs WSL2）
+
+默认用捆绑的 Windows 原生运行时（node.exe + dsh 闭包）直接在本机起后端。设置 → 通用设置 → **桌面 → 后端运行环境** 可切成 **WSL2**：
+
+- **切换**：下拉选 WSL2 → 保存 → 确认重启后端（会中断当前会话）。后端改在所选发行版内运行，经 WSL2 默认 `localhostForwarding` 把发行版内 `127.0.0.1` 端口桥接到本机，WebView/就绪探测无需任何改动。
+- **载荷来源**：优先使用**随安装包携带的 Linux 载荷**（`payload/payload-linux/`，由 Linux/CI 构建时产出）；首次切到 WSL 时自动经 `tar` 管道部署进发行版并按指纹幂等（载荷变了才重部署）。安装包未带 Linux 载荷时（Windows 机器上无法装配——`sharp`/`koffi`/`node-pty` 只有 win32 变体被 `npm ci` 安装），回退为使用发行版内**已装好的 `dsh`**。
+- **进程生命周期**：dsh 在发行版内前台运行，`wsl.exe` 只当中继外壳；关闭/重启时用 pidfile + `kill` 精确回收真实进程，避免孤儿。
+- **数据隔离（MVP）**：WSL 后端用 Linux 侧的独立 `$DSH_HOME`，API Key/会话与 Windows 后端相互独立，需要时在 WSL 里单独配置。
+- **已知限制（MVP）**：代理热切换中继绑定 Windows `127.0.0.1`，WSL2 VM 内不可见，WSL 模式下代理仅随命令透传，不跨 VM 桥接。
+
 ## 网络代理（仅对 DSH 生效，GUI 热生效）
 
 DSH 本体是纯 Node 进程：既不读 Windows"系统代理"（注册表），全局 `fetch` 默认也不理会 `HTTP_PROXY`/`HTTPS_PROXY`（Node ≥24 需要 `NODE_USE_ENV_PROXY=1` 才启用）；而它的 `.env` 加载器把这几个代理变量列为 bootstrap-only、只认**启动方注入的环境**。因此桌面版把代理做成 wrapper 自己的设置：
@@ -31,7 +41,7 @@ DSH 本体是纯 Node 进程：既不读 Windows"系统代理"（注册表），
 - **配置文件**（GUI 与 CLI 共享，可手改）：
   - Windows：`%APPDATA%\dsh-desktop\settings.json`
   - Linux（CLI）：`$XDG_CONFIG_HOME/dsh-desktop/settings.json`（默认 `~/.config/...`）
-  - 格式：`{"proxy":{"enabled":true,"url":"http://127.0.0.1:7897","noProxy":""}}`
+  - 格式：`{"proxy":{"enabled":true,"url":"http://127.0.0.1:7897","noProxy":""},"backend":{"mode":"native"|"wsl","distro":"Ubuntu","deployDir":"~/.local/share/dsh-desktop/backend"}}`
 - 只接受 `http://` / `https://` 代理（HTTP CONNECT 隧道；Clash/v2rayN 等的混合端口直接可用）。文件损坏或字段缺失按"未启用"处理，不会阻塞启动。中继不可用时自动退回静态注入的老行为。
 
 ## 会话通知与提示音（GUI）
@@ -69,7 +79,7 @@ GUI（Windows）                     CLI（Windows / Linux）
 
 载荷版本只有一个事实来源：`package.json` 的 `@deepseek-ai/dsh` 直接依赖。`@deepseek-ai/dsh-web-frontend` 不直接 pin，由 `dsh-web-app` 选择兼容版本；同步脚本和 CI 会验证依赖树中只有这一套前端。
 
-- **手动（一条命令）**：`node scripts/update-dsh.mjs` — 自动查 npm 最新版、精确 pin、重装、验证闭包并冒烟 `dsh --version`；随后本地出包，或直接推 `v*` tag 让 CI 出全平台产物。
+- **手动（一条命令）**：`node scripts/update-dsh.mjs` — 自动查 npm 最新版、精确 pin、重装、验证闭包并冒烟 `dsh --version`；随后本地出包，或直接推 `v*` tag 让 CI 出全平台产物。同步是**只升不降**的：pin 领先于 npm `latest`（如提前采纳 `alpha` 预发布）时保留 pin、跳过同步，CI 周任务不会把预发布 pin 拉回旧 stable。
 - **版本规则与打包闸门**：桌面版号 = 官方 dsh 版本 + 本地打包后缀（官方 `0.1.0-rc.7` → 桌面 `0.1.0-rc.7.1`）。每个 `pack-cli` / `pack-gui` 步骤开头都会跑 `scripts/sync-and-bump.mjs`：先查上游、有新版则同步载荷，再递增打包后缀；`--skip-sync` / `--skip-bump` 可分别跳过两步。
 - **发布即 tag**：CI 的三个打包步骤均带 `--skip-sync --skip-bump`——tag 提交就是版本的唯一事实来源，产物名与 tag 严格一致（此前曾在 CI 内被连 bump 两次导致产物版本漂移）；上游更新只走每周 `update.yml` 的 PR 流程。
 - **自动**：`.github/workflows/update.yml` 每周一检查上游，有新版自动开 PR；PR 必须通过 Windows/Linux 的依赖树、payload、CLI、Web 和原生模块冒烟后才能合并。

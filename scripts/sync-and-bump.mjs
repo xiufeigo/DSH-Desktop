@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url'
 import {
   UPSTREAM_PACKAGE,
   UPSTREAM_REPO,
+  compareVersions,
   nextDesktopVersion,
   readDesktopVersion,
   readPinnedDshVersion,
@@ -62,10 +63,10 @@ function githubTags() {
 }
 
 const pinned = readPinnedDshVersion()
-const npmLatest = latestNpmVersion()
-const tags = githubTags()
+const npmLatest = skipSync ? pinned : latestNpmVersion()
+const tags = skipSync ? [] : githubTags()
 console.log(`sync-and-bump: official repo ${UPSTREAM_REPO}`)
-console.log(`sync-and-bump: pinned ${UPSTREAM_PACKAGE}=${pinned}; npm latest=${npmLatest}`)
+console.log(`sync-and-bump: pinned ${UPSTREAM_PACKAGE}=${pinned}${skipSync ? '' : `; npm latest=${npmLatest}`}`)
 if (tags.length > 0) {
   const unique = [...new Set(tags)]
   console.log(`sync-and-bump: GitHub tags ${unique.slice(-8).join(', ')}`)
@@ -74,12 +75,20 @@ if (tags.length > 0) {
   }
 }
 
-if (!skipSync && pinned !== npmLatest) {
+// Only sync when npm latest is strictly NEWER than the pin. A pin ahead of
+// the `latest` dist-tag (pre-release adopted early) must never downgrade.
+if (!skipSync && compareVersions(npmLatest, pinned) > 0) {
   console.log(`sync-and-bump: syncing payload to ${npmLatest}`)
   const sync = run(process.execPath, ['scripts/update-dsh.mjs'], { stdio: 'inherit' })
   if (sync.status !== 0) process.exit(sync.status ?? 1)
-} else if (pinned === npmLatest) {
-  console.log('sync-and-bump: payload already matches npm latest')
+} else {
+  if (!skipSync && compareVersions(npmLatest, pinned) < 0) {
+    console.log(`sync-and-bump: pinned ${pinned} is ahead of npm latest ${npmLatest}; keeping the pin`)
+  } else if (!skipSync) {
+    console.log('sync-and-bump: payload already matches npm latest')
+  } else {
+    console.log('sync-and-bump: skipping sync check')
+  }
 }
 
 const official = readPinnedDshVersion()

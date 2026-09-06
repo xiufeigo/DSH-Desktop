@@ -23,6 +23,39 @@ use std::path::{Path, PathBuf};
 /// this baseline injected.
 pub const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1";
 
+/// Backend runtime selection. `native` spawns the bundled Windows node.exe
+/// directly (the historical behavior); `wsl` runs the Linux payload inside a
+/// WSL2 distro and bridges its localhost to the WebView via WSL2's
+/// `localhostForwarding`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BackendSettings {
+    /// `"native"` (Windows node.exe) or `"wsl"` (Linux payload in WSL2).
+    pub mode: String,
+    /// WSL distro name (e.g. `Ubuntu`). Empty → let `wsl` pick the default.
+    pub distro: String,
+    /// Linux-side directory the payload is deployed to on first WSL use
+    /// (e.g. `$HOME/.local/share/dsh-desktop/backend`). Expansion of `~/` is
+    /// done by the WSL shell.
+    pub deploy_dir: String,
+}
+
+impl Default for BackendSettings {
+    fn default() -> Self {
+        Self {
+            mode: "native".to_string(),
+            distro: String::new(),
+            deploy_dir: "~/.local/share/dsh-desktop/backend".to_string(),
+        }
+    }
+}
+
+impl BackendSettings {
+    pub fn is_wsl(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("wsl")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProxySettings {
@@ -102,10 +135,20 @@ impl ProxySettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct SettingsFile {
     proxy: ProxySettings,
+    backend: BackendSettings,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            proxy: ProxySettings::default(),
+            backend: BackendSettings::default(),
+        }
+    }
 }
 
 fn settings_file_in(base: &Path) -> PathBuf {
@@ -122,37 +165,40 @@ pub fn settings_path() -> PathBuf {
 
 /// Best-effort load: missing or corrupt file falls back to defaults so a bad
 /// hand-edit can never block startup.
-pub fn load_proxy() -> ProxySettings {
-    load_proxy_from(&settings_path())
-}
-
-pub fn load_proxy_from(path: &Path) -> ProxySettings {
-    let Ok(text) = fs::read_to_string(path) else {
-        return ProxySettings::default();
-    };
-    serde_json::from_str::<SettingsFile>(&text)
-        .map(|file| file.proxy)
+fn load_file(path: &Path) -> SettingsFile {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<SettingsFile>(&text).ok())
         .unwrap_or_default()
 }
 
-/// Persist atomically enough for a hand-edited config file: write a sibling
-/// temp file, then rename over the target.
-pub fn save_proxy(proxy: &ProxySettings) -> Result<(), String> {
-    save_proxy_to(&settings_path(), proxy)
-}
+pub fn load_proxy() -> ProxySettings { load_proxy_from(&settings_path()) }
+pub fn load_proxy_from(path: &Path) -> ProxySettings { load_file(path).proxy }
+pub fn load_backend() -> BackendSettings { load_backend_from(&settings_path()) }
+pub fn load_backend_from(path: &Path) -> BackendSettings { load_file(path).backend }
 
-pub fn save_proxy_to(path: &Path, proxy: &ProxySettings) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| "settings path has no parent directory".to_string())?;
+/// Persist one settings section while preserving all other sections.
+fn save_file(path: &Path, file: &SettingsFile) -> Result<(), String> {
+    let dir = path.parent().ok_or_else(|| "settings path has no parent directory".to_string())?;
     fs::create_dir_all(dir).map_err(|error| format!("创建设置目录失败: {error}"))?;
-    let text = serde_json::to_string_pretty(&SettingsFile {
-        proxy: proxy.clone(),
-    })
-    .map_err(|error| format!("序列化设置失败: {error}"))?;
+    let text = serde_json::to_string_pretty(file).map_err(|error| format!("序列化设置失败: {error}"))?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, text).map_err(|error| format!("写入设置失败: {error}"))?;
     fs::rename(&tmp, path).map_err(|error| format!("保存设置失败: {error}"))
+}
+
+pub fn save_proxy(proxy: &ProxySettings) -> Result<(), String> { save_proxy_to(&settings_path(), proxy) }
+pub fn save_proxy_to(path: &Path, proxy: &ProxySettings) -> Result<(), String> {
+    let mut file = load_file(path);
+    file.proxy = proxy.clone();
+    save_file(path, &file)
+}
+
+pub fn save_backend(backend: &BackendSettings) -> Result<(), String> { save_backend_to(&settings_path(), backend) }
+pub fn save_backend_to(path: &Path, backend: &BackendSettings) -> Result<(), String> {
+    let mut file = load_file(path);
+    file.backend = backend.clone();
+    save_file(path, &file)
 }
 
 #[cfg(test)]
@@ -246,6 +292,48 @@ mod tests {
 
         fs::write(&path, "{not json").unwrap();
         assert_eq!(load_proxy_from(&path), ProxySettings::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backend_settings_default_to_native() {
+        let b = BackendSettings::default();
+        assert!(!b.is_wsl());
+        assert_eq!(b.mode, "native");
+        assert_eq!(b.deploy_dir, "~/.local/share/dsh-desktop/backend");
+    }
+
+    #[test]
+    fn backend_round_trip_through_disk_and_preserves_proxy() {
+        let dir = std::env::temp_dir().join(format!("dsh-gui-backend-test-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = fs::remove_file(&path);
+
+        // Saving only the backend section must leave proxy untouched.
+        let proxy = ProxySettings {
+            enabled: true,
+            url: "http://127.0.0.1:7897".into(),
+            no_proxy: "localhost".into(),
+        };
+        save_proxy_to(&path, &proxy).expect("save proxy");
+        let wsl = BackendSettings {
+            mode: "wsl".into(),
+            distro: "Ubuntu".into(),
+            deploy_dir: "$HOME/.dsh".into(),
+        };
+        save_backend_to(&path, &wsl).expect("save backend");
+        assert_eq!(load_proxy_from(&path), proxy, "proxy must survive backend save");
+        assert_eq!(load_backend_from(&path), wsl);
+        assert!(load_backend_from(&path).is_wsl());
+
+        // Saving proxy afterwards must preserve the backend section.
+        let proxy2 = ProxySettings::default();
+        save_proxy_to(&path, &proxy2).expect("save proxy 2");
+        assert_eq!(load_backend_from(&path), wsl, "backend must survive proxy save");
+
+        // Corrupt file degrades the backend section to defaults.
+        fs::write(&path, "not json").unwrap();
+        assert_eq!(load_backend_from(&path), BackendSettings::default());
         let _ = fs::remove_dir_all(&dir);
     }
 

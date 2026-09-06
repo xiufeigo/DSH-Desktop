@@ -5,6 +5,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { get as httpGet } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -84,6 +85,37 @@ function smokeNodePty() {
 
 const delay = (milliseconds) => new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds))
 
+/**
+ * One raw HTTP GET against the spawned server. Node's global fetch cannot
+ * pass dsh >= 0.1.2-alpha's browser auth: undici follows the 303 to clean
+ * `/` but keeps no cookie jar, drops the minted session cookie, and lands
+ * on 401. Raw `node:http` with explicit cookie forwarding mirrors exactly
+ * what the GUI's Rust readiness probe does.
+ */
+function probeIndex(urlString, cookie) {
+  return new Promise((resolveProbe) => {
+    const headers = { accept: 'text/html' }
+    if (cookie !== undefined) headers.cookie = cookie
+    const request = httpGet(urlString, { headers }, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.on('end', () => {
+        resolveProbe({
+          status: response.statusCode,
+          setCookie: response.headers['set-cookie'],
+          location: response.headers.location,
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+      })
+    })
+    request.on('error', () => resolveProbe(null))
+    request.setTimeout(2_000, () => {
+      request.destroy()
+      resolveProbe(null)
+    })
+  })
+}
+
 async function stopProcess(child) {
   const exited = new Promise((resolveExit) => child.once('exit', resolveExit))
   if (child.exitCode !== null || child.signalCode !== null) return
@@ -127,7 +159,9 @@ async function smokeWeb() {
     const deadline = Date.now() + 60_000
     let url
     while (Date.now() < deadline) {
-      const match = output.match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+)/)
+      // dsh >= 0.1.2-alpha prints the browser-auth launch token on the URL
+      // (`…/?token=…`); older releases print a bare loopback URL.
+      const match = output.match(/dsh web:\s+(http:\/\/127\.0\.0\.1:\d+\/?\S*)/)
       if (match !== null) {
         url = match[1]
         break
@@ -145,16 +179,35 @@ async function smokeWeb() {
       if (child.exitCode !== null) {
         throw new Error(`verify-payload: dsh web exited ${String(child.exitCode)}\n${output}`)
       }
-      try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(2_000) })
-        const body = await response.text()
-        if (response.status >= 200 && response.status < 300 && body.includes('__DSH_BOOT__')) {
-          console.log(`verify-payload: dsh web smoke passed at ${url}`)
-          return
+      const response = await probeIndex(url)
+      let passed = false
+      if (response !== null) {
+        if (response.status >= 200 && response.status < 300 && response.body.includes('__DSH_BOOT__')) {
+          passed = true
+        } else if (
+          response.status >= 300 && response.status < 400 &&
+          Array.isArray(response.setCookie) && response.setCookie.length > 0
+        ) {
+          // Launch-token exchange: replay the minted session cookie and
+          // require the served index with its boot manifest.
+          const cookie = response.setCookie.map((value) => value.split(';')[0]).join('; ')
+          const followed = await probeIndex(new URL(response.location ?? '/', url).href, cookie)
+          if (followed !== null && followed.status >= 200 && followed.status < 300 && followed.body.includes('__DSH_BOOT__')) {
+            passed = true
+          } else if (followed !== null) {
+            lastFailure = `followed HTTP ${String(followed.status)}, boot manifest=${String(followed.body.includes('__DSH_BOOT__'))}`
+          } else {
+            lastFailure = 'followed request failed'
+          }
+        } else {
+          lastFailure = `HTTP ${String(response.status)}, boot manifest=${String(response.body.includes('__DSH_BOOT__'))}`
         }
-        lastFailure = `HTTP ${String(response.status)}, boot manifest=${String(body.includes('__DSH_BOOT__'))}`
-      } catch (error) {
-        lastFailure = error instanceof Error ? error.message : String(error)
+      } else {
+        lastFailure = 'connection failed'
+      }
+      if (passed) {
+        console.log(`verify-payload: dsh web smoke passed at ${url}`)
+        return
       }
       await delay(50)
     }

@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findPackageCopies } from './payload-contract.mjs'
+import { compareVersions } from './desktop-version.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 process.env.npm_config_cache ??= join(root, '.cache', 'npm')
@@ -63,11 +64,18 @@ function verifyClosure() {
 
 if (process.argv.includes('--check')) {
   verifyClosure()
-  process.exit(current === latest ? 0 : 2)
+  // Exit 2 only when npm latest is strictly NEWER than the pin. A pin ahead
+  // of the `latest` dist-tag (e.g. an alpha/rc we adopted early) is valid and
+  // must never be treated as an upstream update — syncing would downgrade.
+  process.exit(compareVersions(latest, current) > 0 ? 2 : 0)
 }
-if (current === latest) {
+if (compareVersions(latest, current) <= 0) {
   verifyClosure()
-  console.log('update-dsh: already up to date')
+  if (compareVersions(latest, current) < 0) {
+    console.log(`update-dsh: pinned dsh=${current} is ahead of npm latest=${latest}; keeping the pin`)
+  } else {
+    console.log('update-dsh: already up to date')
+  }
   process.exit(0)
 }
 

@@ -3,6 +3,7 @@
 mod relay;
 mod settings;
 mod startup;
+mod wsl;
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -34,6 +35,12 @@ static RESTARTING: AtomicBool = AtomicBool::new(false);
 static STARTUP_TRACE: OnceLock<StartupTrace> = OnceLock::new();
 static INTERACTIVE_REPORTED: AtomicBool = AtomicBool::new(false);
 static SERVER_PORT: AtomicU16 = AtomicU16::new(0);
+// 当前后端运行模式："native" 或 "wsl"。spawn_server 据此选择进程构造方式，
+// kill_server 在 WSL 模式下要先杀发行版内的真实进程（wsl.exe 中继只是外壳）。
+static BACKEND_MODE: OnceLock<String> = OnceLock::new();
+// WSL 后端本次启动使用的部署信息（部署目录 + 是否走内置 Linux 载荷），
+// 供 kill_server / server_state 复用，避免每次重读磁盘。
+static WSL_DEPLOY: OnceLock<wsl::DeployOutcome> = OnceLock::new();
 
 const WEBVIEW2_URL: &str = "https://developer.microsoft.com/microsoft-edge/webview2/";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -159,6 +166,48 @@ fn set_proxy_settings(enabled: bool, url: String, no_proxy: String) -> Result<()
     Ok(())
 }
 
+/// Backend runtime preference as saved on disk (`saved`), plus whether the
+/// current run is already in WSL mode and whether a WSL runtime is reachable.
+#[tauri::command]
+fn get_backend_settings() -> serde_json::Value {
+    let saved = settings::load_backend();
+    let current_mode = BACKEND_MODE.get().cloned().unwrap_or_else(|| "native".into());
+    let wsl_ok = wsl::check_wsl().is_ok();
+    let bundled = wsl::bundled_linux_payload_root().is_some();
+    serde_json::json!({
+        "saved": saved,
+        "activeMode": current_mode,
+        "wslAvailable": wsl_ok,
+        "linuxPayloadBundled": bundled,
+    })
+}
+
+/// Validate + persist the backend runtime choice. Does NOT restart on its
+/// own — the panel shows a confirm and then calls `restart_backend` so the
+/// new mode takes effect. Mode must be "native" or "wsl"; when switching to
+/// wsl we also surface whether a Linux payload is bundled so the UI can warn
+/// about the in-distro fallback.
+#[tauri::command]
+fn set_backend_settings(mode: String, distro: String, deploy_dir: String) -> Result<serde_json::Value, String> {
+    if !mode.eq_ignore_ascii_case("native") && !mode.eq_ignore_ascii_case("wsl") {
+        return Err("后端模式必须是 native 或 wsl".to_string());
+    }
+    let entry = settings::BackendSettings {
+        mode,
+        distro,
+        deploy_dir,
+    };
+    settings::save_backend(&entry)?;
+    if entry.is_wsl() {
+        wsl::check_wsl().map_err(|e| format!("无法切换到 WSL 后端：{e}"))?;
+    }
+    let bundled = wsl::bundled_linux_payload_root().is_some();
+    Ok(serde_json::json!({
+        "bundled": bundled,
+        "wslAvailable": wsl::check_wsl().is_ok(),
+    }))
+}
+
 /// Kill the dsh web process and respawn it with the freshly saved settings,
 /// then reuse the normal readiness wait + navigation flow. Sessions running
 /// under the old backend die with it — the panel says so before invoking.
@@ -197,6 +246,10 @@ fn restart_backend(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn kill_server() {
+    let backend = settings::load_backend();
+    if backend.is_wsl() {
+        wsl::kill_remote(&backend);
+    }
     if let Some(mut child) = SERVER.lock().unwrap().take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -316,7 +369,7 @@ fn log_dir() -> PathBuf {
 fn capture_server_stdout(
     stdout: ChildStdout,
     mut log: File,
-    endpoint: SyncSender<Result<u16, startup::WaitReadyError>>,
+    endpoint: SyncSender<Result<startup::ServerEndpoint, startup::WaitReadyError>>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -354,9 +407,9 @@ fn capture_server_stdout(
             }
         }
         if let Some(sender) = endpoint.as_ref() {
-            match startup::parse_server_port(&String::from_utf8_lossy(&line)) {
-                Ok(Some(port)) => {
-                    let _ = sender.try_send(Ok(port));
+            match startup::parse_server_endpoint(&String::from_utf8_lossy(&line)) {
+                Ok(Some(server)) => {
+                    let _ = sender.try_send(Ok(server));
                     endpoint = None;
                 }
                 Ok(None) => {}
@@ -369,15 +422,40 @@ fn capture_server_stdout(
     }
 }
 
-fn spawn_server() -> std::io::Result<(Child, Receiver<Result<u16, startup::WaitReadyError>>)> {
+fn spawn_server() -> std::io::Result<(Child, Receiver<Result<startup::ServerEndpoint, startup::WaitReadyError>>)> {
     let dir = log_dir();
     fs::create_dir_all(&dir)?;
     let stdout_log = File::create(dir.join("dsh-web.log"))?;
     let stderr = stdout_log.try_clone()?;
-    let mut cmd = Command::new(node_binary());
+
+    // 后端运行模式决定进程怎么构造：
+    //   native —— 直接执行捆绑的 Windows node.exe（历史行为）；
+    //   wsl    —— 在选定的发行版内运行 Linux 载荷（或发行版内已装的 dsh），
+    //             wsl.exe 只当中继外壳，stdout 仍走同一管道。
+    let backend = settings::load_backend();
+    let mut cmd;
+    if backend.is_wsl() {
+        wsl::check_wsl()
+            .map_err(std::io::Error::other)?;
+        let (outcome, warning) = wsl::ensure_deployed(&backend)
+            .map_err(std::io::Error::other)?;
+        if let Some(warning) = warning {
+            trace_startup("wsl_deploy_fallback", Some(&warning));
+        }
+        let _ = WSL_DEPLOY.set(outcome);
+        cmd = wsl::build_command(&backend, WSL_DEPLOY.get().unwrap());
+    } else {
+        cmd = Command::new(node_binary());
+        cmd.arg(dsh_script())
+            .args(["--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "0"]);
+    }
+    let _ = BACKEND_MODE.set(backend.mode.clone());
+
     // 代理走本地中继：环境变量只写一次、永远指向 127.0.0.1 的 relay 端口；
     // 上游(Clash 地址或直连)由 GUI 进程持有并可热切换，改设置不用重启后端。
     // 中继万一没起来，退回老行为——把真实地址静态注入。
+    // （WSL 模式下 wsl.exe 会把环境转发进发行版；但中继绑定的是 Windows
+    //  回环地址，WSL2 VM 内不可见，MVP 不做跨 VM 代理桥接，仅随命令透传。）
     let saved = settings::load_proxy();
     let bypass = if saved.no_proxy.trim().is_empty() {
         settings::DEFAULT_NO_PROXY.to_string()
@@ -385,7 +463,17 @@ fn spawn_server() -> std::io::Result<(Child, Receiver<Result<u16, startup::WaitR
         saved.no_proxy.trim().to_string()
     };
     let relay_port = RELAY_PORT.load(Ordering::Acquire);
-    let applied: Option<String> = if relay_port != 0 {
+    let applied: Option<String> = if backend.is_wsl() {
+        // WSL2 NAT cannot reach Windows 127.0.0.1. Remove inherited proxy
+        // variables rather than handing the Linux backend a dead GUI relay.
+        for name in [
+            "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+            "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY",
+        ] {
+            cmd.env_remove(name);
+        }
+        None
+    } else if relay_port != 0 {
         let url = format!("http://127.0.0.1:{relay_port}");
         for (name, value) in [
             ("HTTP_PROXY", url.clone()),
@@ -412,17 +500,17 @@ fn spawn_server() -> std::io::Result<(Child, Receiver<Result<u16, startup::WaitR
     // 否则每次启动都会闪一个黑色 cmd 窗口。
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    cmd.arg(dsh_script())
-        .args(["--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "0"])
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
-    if let Err(error) = put_child_in_kill_job(&child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+    if !backend.is_wsl() {
+        if let Err(error) = put_child_in_kill_job(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
     }
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -577,11 +665,11 @@ fn fail_startup(app: &tauri::AppHandle, message: String) {
     app.exit(1);
 }
 
-fn finish_startup(app: tauri::AppHandle, endpoint: Receiver<Result<u16, startup::WaitReadyError>>) {
+fn finish_startup(app: tauri::AppHandle, endpoint: Receiver<Result<startup::ServerEndpoint, startup::WaitReadyError>>) {
     let started = Instant::now();
     let log = log_dir().join("dsh-web.log");
-    let port = match startup::wait_server_port(&endpoint, READY_TIMEOUT, server_state) {
-        Ok(port) => port,
+    let server = match startup::wait_server_port(&endpoint, READY_TIMEOUT, server_state) {
+        Ok(server) => server,
         Err(error) => {
             fail_startup(
                 &app,
@@ -593,11 +681,11 @@ fn finish_startup(app: tauri::AppHandle, endpoint: Receiver<Result<u16, startup:
             return;
         }
     };
-    SERVER_PORT.store(port, Ordering::Release);
-    trace_startup("server_listening", Some(&format!("port={port}")));
+    SERVER_PORT.store(server.port, Ordering::Release);
+    trace_startup("server_listening", Some(&format!("port={}", server.port)));
 
     let remaining = READY_TIMEOUT.saturating_sub(started.elapsed());
-    match startup::wait_ready(port, remaining, server_state) {
+    match startup::wait_ready(&server, remaining, server_state) {
         Ok(()) => {
             trace_startup("backend_ready", None);
             match server_state() {
@@ -618,7 +706,16 @@ fn finish_startup(app: tauri::AppHandle, endpoint: Receiver<Result<u16, startup:
                 kill_server();
                 return;
             };
-            let url = tauri::Url::parse(&format!("http://127.0.0.1:{port}/"))
+            // dsh >= 0.1.2-alpha gates the web UI behind browser auth: the
+            // reported launch token must reach the WebView so it can mint its
+            // session cookie (303 → cookie → index); older payloads simply
+            // report no query and navigate bare.
+            let mut url = format!("http://127.0.0.1:{}/", server.port);
+            if let Some(query) = &server.query {
+                url.push('?');
+                url.push_str(query);
+            }
+            let url = tauri::Url::parse(&url)
                 .expect("loopback startup URL must be valid");
             if let Err(error) = window.navigate(url) {
                 fail_startup(&app, format!("无法加载 DSH 界面：{error}"));
@@ -657,6 +754,8 @@ fn main() {
             show_desktop_notification,
             get_proxy_settings,
             set_proxy_settings,
+            get_backend_settings,
+            set_backend_settings,
             restart_backend
         ])
         .setup(|app| {

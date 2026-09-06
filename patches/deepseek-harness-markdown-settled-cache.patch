@@ -1,12 +1,13 @@
 diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
+index 3a26bac424..b791ceecef 100644
 --- a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
 +++ b/packages/client/ui-primitives/src/markdown/MarkdownText.tsx
 @@ -25,6 +25,45 @@ import css from './MarkdownText.module.css'
  
- export type { MarkdownCodeLabels, MarkdownFileMentions } from './render.tsx'
+ export type { MarkdownCodeLabels, MarkdownFileMentions, MarkdownLabels } from './render.tsx'
  
 +/**
-+ * Settled renders are a pure function of (text, codeLabels, fileMentions),
++ * Settled renders are a pure function of (text, labels, fileMentions),
 + * but they re-parse the entire reply (GFM + KaTeX) whenever a finished
 + * message remounts — switching back to a long session re-renders every
 + * message and pays that cost for all of them at once. Memoize the last N
@@ -23,17 +24,17 @@ diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packa
 +/** Last-N LRU memoization over {@link renderSettled}, keyed by its inputs. */
 +function renderSettledCached(
 +  text: string,
-+  codeLabels: MarkdownCodeLabels | undefined,
++  labels: MarkdownLabels,
 +  fileMentions: MarkdownFileMentions | undefined,
 +): ReactNode[] {
-+  const key = JSON.stringify([text, codeLabels, fileMentions])
++  const key = JSON.stringify([text, labels, fileMentions])
 +  const fresh = settledCache.get(key)
 +  if (fresh !== undefined) {
 +    settledCache.delete(key)
 +    settledCache.set(key, fresh)
 +    return fresh
 +  }
-+  const children = renderSettled(text, codeLabels, fileMentions)
++  const children = renderSettled(text, labels, fileMentions)
 +  if (settledCache.size >= SETTLED_CACHE_LIMIT) {
 +    for (const oldest of settledCache.keys()) {
 +      settledCache.delete(oldest)
@@ -47,12 +48,12 @@ diff --git a/packages/client/ui-primitives/src/markdown/MarkdownText.tsx b/packa
  /** One settled full render: parse with math, resolve references, append the footnote section. */
  function renderSettled(
    text: string,
-@@ -164,7 +203,7 @@ export const MarkdownText = memo(function MarkdownText({ text, streaming = false
+@@ -165,7 +204,7 @@ export const MarkdownText = memo(function MarkdownText({ text, streaming = false
    const children = useMemo(() => {
      if (!streaming) {
        streamRef.current = null
--      return renderSettled(text, codeLabels, fileMentions)
-+      return renderSettledCached(text, codeLabels, fileMentions)
+-      return renderSettled(text, labels, fileMentions)
++      return renderSettledCached(text, labels, fileMentions)
      }
-     if (streamRef.current === null || streamLabelsRef.current !== codeLabels) {
-       streamRef.current = new StreamingRenderer(codeLabels)
+     if (streamRef.current === null || streamLabelsRef.current !== labels) {
+       streamRef.current = new StreamingRenderer(labels)

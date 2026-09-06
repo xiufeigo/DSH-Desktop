@@ -57,13 +57,34 @@ impl fmt::Display for WaitReadyError {
     }
 }
 
-pub fn parse_server_port(log: &str) -> Result<Option<u16>, WaitReadyError> {
+/// Loopback endpoint reported by `dsh web` on stdout.
+///
+/// Upstream 0.1.2-alpha.1+ prints the browser-auth launch token on the root
+/// URL (`http://127.0.0.1:<port>/?token=...`, dsh-client-connection
+/// BrowserAuth). Older releases print a bare URL. The query must be preserved
+/// verbatim: without it every index request answers 401 and the UI never
+/// loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEndpoint {
+    pub port: u16,
+    /// Raw query string from the reported URL (e.g. `token=...`), if any.
+    pub query: Option<String>,
+}
+
+pub fn parse_server_endpoint(log: &str) -> Result<Option<ServerEndpoint>, WaitReadyError> {
     for line in log.lines() {
         let Some(endpoint) = line.trim().strip_prefix(SERVER_URL_PREFIX) else {
             continue;
         };
         let normalized = endpoint.strip_suffix('/').unwrap_or(endpoint);
-        let Some(port) = normalized.strip_prefix("http://127.0.0.1:") else {
+        // Split off the query before validating the loopback URL: the port
+        // must be parsed from the authority only.
+        let (base, query) = match normalized.split_once('?') {
+            Some((base, query)) => (base, Some(query.to_string())),
+            None => (normalized, None),
+        };
+        let base = base.strip_suffix('/').unwrap_or(base);
+        let Some(port) = base.strip_prefix("http://127.0.0.1:") else {
             return Err(WaitReadyError::InvalidEndpoint(endpoint.to_string()));
         };
         let Ok(port) = port.parse::<u16>() else {
@@ -72,7 +93,7 @@ pub fn parse_server_port(log: &str) -> Result<Option<u16>, WaitReadyError> {
         if port == 0 {
             return Err(WaitReadyError::InvalidEndpoint(endpoint.to_string()));
         }
-        return Ok(Some(port));
+        return Ok(Some(ServerEndpoint { port, query }));
     }
     Ok(None)
 }
@@ -102,27 +123,24 @@ pub fn is_ready_response(response: &[u8]) -> bool {
         .any(|window| window == BOOT_MARKER)
 }
 
-fn probe_ready(port: u16, timeout: Duration) -> bool {
-    if timeout.is_zero() {
-        return false;
-    }
-    let started = Instant::now();
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+/// One HTTP round trip against the loopback web server. Returns the full
+/// raw response (headers + body) until the server closes the connection.
+fn round_trip(address: SocketAddr, path: &str, cookie: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
     let Ok(mut stream) = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT.min(timeout)) else {
-        return false;
+        return None;
     };
-    let remaining = timeout.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
-        return false;
-    }
-    let io_timeout = READ_TIMEOUT.min(remaining);
+    let io_timeout = READ_TIMEOUT.min(timeout);
     let _ = stream.set_read_timeout(Some(io_timeout));
     let _ = stream.set_write_timeout(Some(io_timeout));
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: text/html\r\n\r\n"
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAccept: text/html\r\n"
     );
+    if let Some(cookie) = cookie {
+        request.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
+    request.push_str("\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+        return None;
     }
 
     let mut response = Vec::new();
@@ -131,9 +149,74 @@ fn probe_ready(port: u16, timeout: Duration) -> bool {
         .read_to_end(&mut response)
         .is_err()
     {
+        return None;
+    }
+    Some(response)
+}
+
+/// Status line of a raw HTTP response, e.g. `HTTP/1.1 303 See Other`.
+fn response_status(response: &[u8]) -> Option<u16> {
+    let headers_end = response.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let status_end = response[..headers_end].windows(2).position(|window| window == b"\r\n")?;
+    let status_line = std::str::from_utf8(&response[..status_end]).ok()?;
+    let mut fields = status_line.split_ascii_whitespace();
+    let protocol = fields.next()?;
+    if protocol != "HTTP/1.0" && protocol != "HTTP/1.1" {
+        return None;
+    }
+    fields.next()?.parse::<u16>().ok()
+}
+
+/// First `set-cookie` header value of a raw HTTP response, trimmed to the
+/// `name=value` pair (dropping Path/HttpOnly/… attributes).
+fn redirect_cookie(response: &[u8]) -> Option<String> {
+    let headers_end = response.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let header_block = std::str::from_utf8(&response[..headers_end]).ok()?;
+    for line in header_block.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let pair = value.split(';').next()?.trim();
+        if pair.contains('=') {
+            return Some(pair.to_string());
+        }
+    }
+    None
+}
+
+fn probe_ready(endpoint: &ServerEndpoint, timeout: Duration) -> bool {
+    if timeout.is_zero() {
         return false;
     }
-    is_ready_response(&response)
+    let started = Instant::now();
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), endpoint.port);
+    // dsh >= 0.1.2-alpha gates the index behind browser auth: a bare request
+    // answers 401, the launch-token URL mints a session cookie via 303.
+    let path = match &endpoint.query {
+        Some(query) => format!("/?{query}"),
+        None => "/".to_string(),
+    };
+    let Some(response) = round_trip(address, &path, None, timeout) else {
+        return false;
+    };
+    if is_ready_response(&response) {
+        return true;
+    }
+    // Token exchange: replay the issued cookie and require the served index.
+    if matches!(response_status(&response), Some(301 | 302 | 303 | 307 | 308)) {
+        let Some(cookie) = redirect_cookie(&response) else {
+            return false;
+        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let Some(response) = round_trip(address, "/", Some(&cookie), remaining) else {
+            return false;
+        };
+        return is_ready_response(&response);
+    }
+    false
 }
 
 fn wait_ready_with<C, P>(
@@ -179,10 +262,10 @@ fn wait_server_port_with<C, E>(
     poll_interval: Duration,
     mut child_state: C,
     mut receive_endpoint: E,
-) -> Result<u16, WaitReadyError>
+) -> Result<ServerEndpoint, WaitReadyError>
 where
     C: FnMut() -> Result<ChildState, String>,
-    E: FnMut(Duration) -> Result<Option<Result<u16, WaitReadyError>>, String>,
+    E: FnMut(Duration) -> Result<Option<Result<ServerEndpoint, WaitReadyError>>, String>,
 {
     let deadline = Instant::now() + timeout;
     loop {
@@ -203,10 +286,10 @@ where
 }
 
 pub fn wait_server_port<C>(
-    endpoint: &Receiver<Result<u16, WaitReadyError>>,
+    endpoint: &Receiver<Result<ServerEndpoint, WaitReadyError>>,
     timeout: Duration,
     child_state: C,
-) -> Result<u16, WaitReadyError>
+) -> Result<ServerEndpoint, WaitReadyError>
 where
     C: FnMut() -> Result<ChildState, String>,
 {
@@ -224,12 +307,12 @@ where
     )
 }
 
-pub fn wait_ready<C>(port: u16, timeout: Duration, child_state: C) -> Result<(), WaitReadyError>
+pub fn wait_ready<C>(endpoint: &ServerEndpoint, timeout: Duration, child_state: C) -> Result<(), WaitReadyError>
 where
     C: FnMut() -> Result<ChildState, String>,
 {
     wait_ready_with(timeout, READY_POLL_INTERVAL, child_state, |remaining| {
-        probe_ready(port, remaining)
+        probe_ready(endpoint, remaining)
     })
 }
 
@@ -267,18 +350,46 @@ mod tests {
     #[test]
     fn parses_only_the_loopback_endpoint_reported_by_dsh() {
         assert_eq!(
-            parse_server_port("plugin output\ndsh web: http://127.0.0.1:49152\n"),
-            Ok(Some(49_152))
+            parse_server_endpoint("plugin output\ndsh web: http://127.0.0.1:49152\n"),
+            Ok(Some(ServerEndpoint { port: 49_152, query: None }))
         );
-        assert_eq!(parse_server_port("plugin output\n"), Ok(None));
+        assert_eq!(
+            parse_server_endpoint("plugin output\n"),
+            Ok(None)
+        );
         assert!(matches!(
-            parse_server_port("dsh web: http://evil.example:49152\n"),
+            parse_server_endpoint("dsh web: http://evil.example:49152\n"),
             Err(WaitReadyError::InvalidEndpoint(_))
         ));
         assert!(matches!(
-            parse_server_port("dsh web: http://127.0.0.1:not-a-port\n"),
+            parse_server_endpoint("dsh web: http://127.0.0.1:not-a-port\n"),
             Err(WaitReadyError::InvalidEndpoint(_))
         ));
+    }
+
+    #[test]
+    fn parses_launch_token_urls_reported_since_alpha() {
+        // 0.1.2-alpha.2 prints `http://127.0.0.1:<port>/?token=...`.
+        assert_eq!(
+            parse_server_endpoint("dsh web: http://127.0.0.1:56412/?token=-3ur_o5w.tA\n"),
+            Ok(Some(ServerEndpoint {
+                port: 56_412,
+                query: Some("token=-3ur_o5w.tA".to_string()),
+            }))
+        );
+        // Token without the trailing slash, plus extra params, verbatim.
+        assert_eq!(
+            parse_server_endpoint("dsh web: http://127.0.0.1:8080?token=abc&x=1\n"),
+            Ok(Some(ServerEndpoint {
+                port: 8_080,
+                query: Some("token=abc&x=1".to_string()),
+            }))
+        );
+        // A bare URL with a trailing slash must keep parsing (older versions).
+        assert_eq!(
+            parse_server_endpoint("dsh web: http://127.0.0.1:49152/\n"),
+            Ok(Some(ServerEndpoint { port: 49_152, query: None }))
+        );
     }
 
     #[test]
@@ -386,8 +497,11 @@ mod tests {
             Duration::from_secs(1),
             READY_POLL_INTERVAL,
             || Ok(ChildState::Running),
-            |_| Ok(Some(Ok(49_152))),
+            |_| Ok(Some(Ok(ServerEndpoint { port: 49_152, query: None }))),
         );
-        assert_eq!(result, Ok(49_152));
+        assert_eq!(
+            result,
+            Ok(ServerEndpoint { port: 49_152, query: None })
+        );
     }
 }

@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { readDesktopVersion } from './desktop-version.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+process.env.npm_config_cache ??= join(root, '.cache', 'npm')
 const plat = process.argv.includes('--linux') ? 'linux' : 'win'
 if (plat === 'linux' && process.platform === 'win32') {
   throw new Error('pack-cli: Linux binary must be built on Linux; use the release workflow or a Linux box')

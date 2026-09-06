@@ -763,6 +763,21 @@
         soundErrors: 'Errors',
         soundErrorsHint: 'Play a sound when an error occurs.',
         soundNone: 'None',
+        backendTitle: 'Backend runtime',
+        backendMode: 'Backend',
+        backendNative: 'Windows native',
+        backendWsl: 'WSL2 (Linux)',
+        backendDistro: 'WSL distro (blank = default)',
+        backendDeployDir: 'Linux payload directory',
+        backendApply: 'Save and restart backend',
+        backendWarn: 'Switching restarts DSH and interrupts the current session.',
+        backendFallback: 'No bundled Linux payload; WSL must already have dsh installed.',
+        backendReady: 'WSL backend is available.',
+        backendUnavailable: 'WSL is unavailable: ',
+        backendSaved: 'Saved. Restarting backend…',
+        backendError: 'Failed: ',
+        backendNativeHint: 'Uses the bundled Windows runtime.',
+        backendWslHint: 'Uses Linux inside WSL2; API keys and sessions are separate.',
         proxyTitle: 'Network proxy',
         proxyEnable: 'Enable proxy (this app only)',
         proxyUrl: 'Proxy URL',
@@ -802,6 +817,21 @@
       soundErrors: '错误',
       soundErrorsHint: '发生错误时播放提示音。',
       soundNone: '无',
+      backendTitle: '后端运行环境',
+      backendMode: '后端',
+      backendNative: 'Windows 原生',
+      backendWsl: 'WSL2 (Linux)',
+      backendDistro: 'WSL 发行版（留空=默认）',
+      backendDeployDir: 'Linux 载荷目录',
+      backendApply: '保存并重启后端',
+      backendWarn: '切换会重启 DSH 后端并中断当前会话。',
+      backendFallback: '未内置 Linux 载荷；需在 WSL 内预先安装 dsh。',
+      backendReady: '已检测到可用的 WSL。',
+      backendUnavailable: 'WSL 不可用：',
+      backendSaved: '已保存。正在重启后端…',
+      backendError: '失败：',
+      backendNativeHint: '使用内置的 Windows 运行时。',
+      backendWslHint: '使用 WSL2 内的 Linux；API Key 与会话相互独立。',
       proxyTitle: '网络代理',
       proxyEnable: '启用代理（仅 DSH 生效）',
       proxyUrl: '代理地址',
@@ -913,6 +943,148 @@
     tintRow.appendChild(tintSlider)
     tintRow.appendChild(tintHint)
     panel.appendChild(tintRow)
+
+    // —— 后端运行环境：Windows 原生 vs WSL2。偏好存 %APPDATA%\dsh-desktop\
+    // settings.json 的 backend 段；切换保存后由 Rust 端重启后端生效。
+    // WSL 模式首次启用时会把内置 Linux 载荷（若随包携带）部署进所选发行版。
+    const backendHeading = document.createElement('div')
+    backendHeading.className = 'dsh-gui-settings-title'
+    backendHeading.textContent = copy.backendTitle
+    panel.appendChild(backendHeading)
+
+    let backendLoaded = false
+    let backendSaved = null
+
+    function backendTextRow(labelText, placeholderText, value) {
+      const row = document.createElement('div')
+      row.className = 'dsh-gui-settings-row'
+      const label = document.createElement('div')
+      label.className = 'dsh-gui-settings-label'
+      label.textContent = labelText
+      const input = document.createElement('input')
+      input.type = 'text'
+      input.placeholder = placeholderText
+      input.value = value || ''
+      input.setAttribute('spellcheck', 'false')
+      input.setAttribute('autocomplete', 'off')
+      input.setAttribute('aria-label', labelText)
+      input.disabled = true
+      row.appendChild(label)
+      row.appendChild(input)
+      panel.appendChild(row)
+      return input
+    }
+
+    const backendModeRow = document.createElement('div')
+    backendModeRow.className = 'dsh-gui-settings-row'
+    const modeLabel = document.createElement('div')
+    modeLabel.className = 'dsh-gui-settings-label'
+    modeLabel.textContent = copy.backendMode
+    const modeSelect = document.createElement('select')
+    modeSelect.className = 'dsh-gui-settings-select'
+    modeSelect.setAttribute('aria-label', copy.backendMode)
+    modeSelect.disabled = true
+    for (const [value, text] of [
+      ['native', copy.backendNative],
+      ['wsl', copy.backendWsl],
+    ]) {
+      const option = document.createElement('option')
+      option.value = value
+      option.textContent = text
+      modeSelect.appendChild(option)
+    }
+    backendModeRow.appendChild(modeLabel)
+    backendModeRow.appendChild(modeSelect)
+    panel.appendChild(backendModeRow)
+
+    const distroInput = backendTextRow(copy.backendDistro, 'Ubuntu')
+    const deployInput = backendTextRow(copy.backendDeployDir, '~/.local/share/dsh-desktop/backend')
+    deployInput.value = deployInput.value || '~/.local/share/dsh-desktop/backend'
+
+    const backendStatus = document.createElement('p')
+    backendStatus.className = 'dsh-gui-settings-hint'
+    panel.appendChild(backendStatus)
+
+    const backendHint = document.createElement('p')
+    backendHint.className = 'dsh-gui-settings-hint'
+    panel.appendChild(backendHint)
+
+    const backendApply = document.createElement('button')
+    backendApply.type = 'button'
+    backendApply.className = 'dsh-gui-settings-apply'
+    backendApply.textContent = copy.backendApply
+    backendApply.disabled = true
+    panel.appendChild(backendApply)
+
+    function backendSyncControls() {
+      const wsl = modeSelect.value === 'wsl'
+      distroInput.disabled = !wsl || !backendLoaded
+      deployInput.disabled = !wsl || !backendLoaded
+      backendApply.disabled = !backendLoaded
+    }
+
+    function backendStatusText(state) {
+      if (!backendSaved) return ''
+      const mode = String(modeSelect.value)
+      if (mode === 'wsl' && state && state.wslAvailable === false) {
+        return copy.backendUnavailable.slice(0, -2)
+      }
+      if (mode === 'wsl' && state && state.linuxPayloadBundled === false) {
+        return copy.backendFallback
+      }
+      if (mode === 'wsl') return copy.backendReady
+      return copy.backendNativeHint
+    }
+
+    modeSelect.addEventListener('change', function () {
+      backendSyncControls()
+      backendStatus.textContent = backendStatusText({})
+      backendHint.textContent = modeSelect.value === 'wsl' ? copy.backendWslHint : copy.backendNativeHint
+    })
+
+    backendApply.addEventListener('click', function () {
+      if (backendApply.disabled) return
+      if (!window.confirm(copy.backendWarn)) return
+      backendApply.disabled = true
+      backendStatus.textContent = copy.applying
+      tauriInvoke('set_backend_settings', {
+        mode: modeSelect.value,
+        distro: distroInput.value.trim(),
+        deployDir: deployInput.value.trim() || '~/.local/share/dsh-desktop/backend',
+      })
+        .then(function (result) {
+          backendStatus.textContent = copy.backendSaved
+          backendStatus.dataset.restart = '1'
+          return tauriInvoke('restart_backend')
+        })
+        .then(function () {
+          if (panel.isConnected) {
+            backendStatus.textContent = copy.backendSaved
+            backendApply.disabled = false
+          }
+        })
+        .catch(function (error) {
+          if (!panel.isConnected) return
+          backendStatus.textContent =
+            copy.backendError + String((error && error.message) || error || '')
+          backendApply.disabled = false
+        })
+    })
+
+    tauriInvoke('get_backend_settings').then(function (state) {
+      if (!panel.isConnected || !state) return
+      backendSaved = state.saved || {}
+      backendLoaded = true
+      modeSelect.value = backendSaved.mode === 'wsl' ? 'wsl' : 'native'
+      distroInput.value = String(backendSaved.distro || '')
+      deployInput.value = String(backendSaved.deployDir || '~/.local/share/dsh-desktop/backend')
+      backendSyncControls()
+      backendStatus.textContent = backendStatusText(state)
+      backendHint.textContent = modeSelect.value === 'wsl' ? copy.backendWslHint : copy.backendNativeHint
+    }, function () {
+      if (!panel.isConnected) return
+      backendStatus.textContent = copy.backendError + 'get_backend_settings'
+    })
 
     // —— 系统通知 / 音效：三个通道沿用 opencode 的语义（agent=回合完成、
     // permissions=审批/提问、errors=出错），偏好由 notify.js 消费；音效资源

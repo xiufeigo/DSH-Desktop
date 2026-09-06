@@ -59,6 +59,22 @@ run(process.execPath, ['scripts/make-icons.mjs'], 'icons')
 const crateDir = join(root, 'crates', 'dsh-gui')
 rmSync(join(crateDir, 'payload'), { recursive: true, force: true })
 cpSync(join(root, '.work', 'payload-win'), join(crateDir, 'payload'), { recursive: true, force: true })
+
+// WSL 后端所需的 Linux 载荷：由于 sharp/koffi/node-pty 只有 win32 变体在
+// Windows 机器上由 npm ci 安装，Linux 载荷必须由 Linux/CI 构建后带上
+// `.work/payload-linux` 再打包。打包时若存在则随安装器一起打进
+// crates/dsh-gui/payload/payload-linux（Tauri resources 已匹配 payload/**/*），
+// GUI 切到 WSL 后端时自动把它部署进所选发行版；缺失则 WSL 模式回退为
+// 使用发行版内已装的 dsh，安装包因此也不额外膨胀。
+const linuxPayloadIn = join(root, '.work', 'payload-linux')
+const linuxPayloadOut = join(crateDir, 'payload', 'payload-linux')
+rmSync(linuxPayloadOut, { recursive: true, force: true })
+if (existsSync(linuxPayloadIn)) {
+  cpSync(linuxPayloadIn, linuxPayloadOut, { recursive: true, force: true })
+  console.log('pack-gui: bundled linux payload payload-linux')
+} else {
+  console.log('pack-gui: no .work/payload-linux found — WSL backend falls back to in-distro dsh')
+}
 mkdirSync(join(crateDir, 'icons'), { recursive: true })
 cpSync(join(root, 'build', 'icon.ico'), join(crateDir, 'icons', 'icon.ico'), { force: true })
 
