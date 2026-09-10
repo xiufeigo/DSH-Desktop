@@ -8,7 +8,7 @@
  * Usage: node scripts/prepare-payload.mjs <win|linux> <out-dir>
  */
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findPackageCopies, verifyPayloadContract, writePayloadManifest } from './payload-contract.mjs'
@@ -138,39 +138,35 @@ const prune = (dir) => {
 prune(destRoot)
 console.log(`prepare-payload: pruned ${prunedFiles} non-runtime files + ${prunedDirs} test dir(s)`)
 
-// 5. windowsHide 补丁：GUI 进程自身没有控制台，dsh 通过
-//    dsh-subprocess-local 拉起 pwsh / bash / taskkill 等控制台程序时，
-//    若不设 windowsHide，Windows 会为每个子进程新开一个空白终端窗口。
-//    这里在载荷复制完成后给 spawn 点打补丁；若上游包结构变化导致
-//    匹配失败，直接报错而不是静默失效。
+// 5. windowsHide 覆盖断言（不再修改上游源码）。
+//    GUI 进程自身没有控制台，dsh 通过 dsh-subprocess-local 拉起 pwsh / bash /
+//    taskkill 等控制台程序时若不设 windowsHide，Windows 会为每个子进程新开一个
+//    空白终端窗口。上游从 0.1.5 起自己就在这些点设好了（runner 的 detached 启动
+//    点 + 两处 taskkill），因此这里只断言覆盖仍然存在，不再打补丁：既守住"不改
+//    上游源"的接入规范，也不依赖会被重新哈希的 runner-launch-*.js 文件名。
 {
-  const subprocessIndex = join(destRoot, '@deepseek-ai', 'dsh-subprocess-local', 'lib', 'index.js')
-  if (!existsSync(subprocessIndex)) {
-    throw new Error('prepare-payload: dsh-subprocess-local/lib/index.js missing from closure')
+  const subprocessLib = join(destRoot, '@deepseek-ai', 'dsh-subprocess-local', 'lib')
+  if (!existsSync(subprocessLib)) {
+    throw new Error('prepare-payload: dsh-subprocess-local/lib missing from closure')
   }
-  const patch = (source, from, to, what) => {
-    if (!source.includes(from)) {
-      throw new Error(`prepare-payload: windowsHide patch target missing (${what}) — upstream package changed?`)
+  const sources = readdirSync(subprocessLib)
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => readFileSync(join(subprocessLib, name), 'utf8'))
+    .join('\n')
+  const taskkillSites = [...sources.matchAll(/"taskkill"/g)].map((match) => match.index ?? 0)
+  if (taskkillSites.length === 0) {
+    throw new Error('prepare-payload: no taskkill spawn site found in dsh-subprocess-local — upstream changed?')
+  }
+  for (const index of taskkillSites) {
+    if (!sources.slice(index, index + 400).includes('windowsHide')) {
+      throw new Error('prepare-payload: a taskkill spawn site lost windowsHide — console windows would flash again')
     }
-    return source.replace(from, to)
   }
-  let source = readFileSync(subprocessIndex, 'utf8')
-  source = patch(
-    source,
-    'detached: platform !== "win32"',
-    'detached: platform !== "win32",\n\t\twindowsHide: true',
-    'spawn detached flag',
-  )
-  const taskkillFrom = '], { stdio: "ignore" });'
-  const taskkillTo = '], { stdio: "ignore", windowsHide: true });'
-  const taskkillHits = source.split(taskkillFrom).length - 1
-  if (taskkillHits === 0) {
-    throw new Error('prepare-payload: windowsHide patch target missing (taskkill spawnSync) — upstream package changed?')
+  if (!/detached:\s*platform !== "win32"[\s\S]{0,160}?windowsHide/.test(sources)) {
+    throw new Error('prepare-payload: the detached runner spawn lost windowsHide — console windows would flash again')
   }
-  source = source.split(taskkillFrom).join(taskkillTo)
-  writeFileSync(subprocessIndex, source)
   console.log(
-    `prepare-payload: patched dsh-subprocess-local spawn points with windowsHide:true (${String(taskkillHits)} taskkill site(s))`,
+    `prepare-payload: windowsHide 覆盖断言通过（runner 启动点 + ${String(taskkillSites.length)} 处 taskkill）`,
   )
 }
 

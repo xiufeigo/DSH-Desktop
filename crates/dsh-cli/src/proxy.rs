@@ -2,12 +2,13 @@
 //!
 //! Mirrors `crates/dsh-gui/src/settings.rs` on purpose: the two launchers are
 //! independent Cargo projects, but they must agree on the same
-//! `settings.json` so the desktop app and the CLI inject identical network
-//! bootstrap environment. The DeepSeek Harness accepts `HTTP_PROXY` /
-//! `HTTPS_PROXY` / `NO_PROXY` / `NODE_USE_ENV_PROXY` only from the launching
-//! environment (its `.env` loader rejects those names as bootstrap-only), and
-//! Node's global `fetch` additionally needs `NODE_USE_ENV_PROXY=1` before it
-//! honors the variables at all (Node >= 24). Injection here reaches the dsh
+//! `settings.json` so the desktop app and the CLI hand dsh an identical launch
+//! environment. dsh >= 0.1.5 resolves its proxy policy from that environment
+//! once per boot (`@deepseek-ai/dsh-http-proxy`) and installs it as undici's
+//! global dispatcher, so injecting the variables here is the whole job — no
+//! relay, and no `NODE_USE_ENV_PROXY` for the wrapper to manage. A one-shot
+//! CLI process reads the current preference on every run, so a saved change is
+//! already in effect for the next invocation. Injection reaches the dsh
 //! process tree — plugins, sessions, tool calls — and nothing else on the
 //! machine.
 
@@ -63,6 +64,8 @@ impl ProxySettings {
 
     /// Uppercase entries for Node/undici plus lowercase duplicates so tools
     /// that only read the lowercase spellings behave identically.
+    /// `NODE_USE_ENV_PROXY` is deliberately absent — dsh's own policy installs
+    /// the dispatcher and decides whether child processes get that flag.
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let bypass = if self.no_proxy.is_empty() {
             DEFAULT_NO_PROXY.to_string()
@@ -76,7 +79,6 @@ impl ProxySettings {
             ("https_proxy".into(), self.url.clone()),
             ("NO_PROXY".into(), bypass.clone()),
             ("no_proxy".into(), bypass),
-            ("NODE_USE_ENV_PROXY".into(), "1".into()),
         ]
     }
 
@@ -188,9 +190,9 @@ mod tests {
             vars.iter().find(|(key, _)| key == "NO_PROXY").unwrap().1,
             DEFAULT_NO_PROXY
         );
-        assert_eq!(
-            vars.iter().find(|(key, _)| key == "NODE_USE_ENV_PROXY").unwrap().1,
-            "1"
+        assert!(
+            vars.iter().all(|(key, _)| key != "NODE_USE_ENV_PROXY"),
+            "the wrapper must leave NODE_USE_ENV_PROXY to dsh's own policy"
         );
     }
 }

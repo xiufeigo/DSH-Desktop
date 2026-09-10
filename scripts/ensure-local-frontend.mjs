@@ -87,16 +87,35 @@ const localDist = join(harnessDir, 'apps', 'web', 'dist')
 
 if (!existsSync(join(localDist, 'index.html'))) {
   console.warn(`ensure-local-frontend: [warn] 未找到本地补丁前端构建（${localDist}），本包按官方前端发布。`)
-  console.warn('                       如需携带源码补丁：在 harness 检出先跑 `pnpm run build:lib:client && pnpm run build:web` 再打包。')
+  console.warn('                       如需携带源码补丁：在 harness 检出先跑 `pnpm install && pnpm run build:lib:host && pnpm run build:lib:client && pnpm run build:web` 再打包。')
   process.exit(0)
 }
 
 const marker = scanMarker(localDist)
 if (!marker.hit) {
   fail(`本地构建 ${localDist} 的 sourcemap 不含补丁标记 renderSettledCached（扫描了 ${marker.maps} 个 map）。` +
-    '请重跑 pnpm run build:lib:client && pnpm run build:web；确要忽略请用 pack 的 --skip-local-frontend。')
+    '请重跑 pnpm run build:lib:host && pnpm run build:lib:client && pnpm run build:web；确要忽略请用 pack 的 --skip-local-frontend。')
 }
 console.log(`ensure-local-frontend: 补丁标记校验通过 —— ${marker.hit}`)
+
+// 版本闸门：补丁前端必须与载荷 pin 的官方版本同源。只校验补丁标记是不够的
+// ——上一版检出构建出的 dist 同样带标记，却会与新版后端对不上（客户端启动图
+// 与 RPC 面都可能已变），那会静默打出错配载荷。
+const harnessFrontend = join(harnessDir, 'apps', 'web', 'package.json')
+if (!existsSync(harnessFrontend)) {
+  fail(`版本闸门失败：找不到 ${harnessFrontend}，无法确认本地构建的版本。`)
+}
+const buildVersion = JSON.parse(readFileSync(harnessFrontend, 'utf8')).version
+const pinnedVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).dependencies['@deepseek-ai/dsh']
+if (buildVersion !== pinnedVersion) {
+  fail(
+    `版本闸门失败：本地构建的补丁前端是 ${buildVersion}，载荷 pin 的是 ${pinnedVersion}。` +
+    `请在 harness 检出切到 dsh-v${pinnedVersion} 后重跑 ` +
+    '`pnpm install && pnpm run build:lib:host && pnpm run build:lib:client && pnpm run build:web`；' +
+    '确要按官方前端出包请传 pack 的 --skip-local-frontend。',
+  )
+}
+console.log(`ensure-local-frontend: 前端版本与载荷一致 —— ${pinnedVersion}`)
 
 console.log(`ensure-local-frontend: 注入仓库载荷前端（幂等）… 源补丁: ${patches.join(', ')}`)
 const injected = spawnSync(process.execPath, [join(root, 'scripts', 'inject-local-frontend.mjs'), '--only', 'repo'], {

@@ -27,22 +27,22 @@ dsh-cli-<ver>-linux-x64         # chmod +x 后即可运行
 - **载荷来源**：优先使用**随安装包携带的 Linux 载荷**（`payload/payload-linux/`，由 Linux/CI 构建时产出）；首次切到 WSL 时自动经 `tar` 管道部署进发行版并按指纹幂等（载荷变了才重部署）。安装包未带 Linux 载荷时（Windows 机器上无法装配——`sharp`/`koffi`/`node-pty` 只有 win32 变体被 `npm ci` 安装），回退为使用发行版内**已装好的 `dsh`**。
 - **进程生命周期**：dsh 在发行版内前台运行，`wsl.exe` 只当中继外壳；关闭/重启时用 pidfile + `kill` 精确回收真实进程，避免孤儿。
 - **数据隔离（MVP）**：WSL 后端用 Linux 侧的独立 `$DSH_HOME`，API Key/会话与 Windows 后端相互独立，需要时在 WSL 里单独配置。
-- **已知限制（MVP）**：代理热切换中继绑定 Windows `127.0.0.1`，WSL2 VM 内不可见，WSL 模式下代理仅随命令透传，不跨 VM 桥接。
+- **代理与 WSL**：WSL2 的 VM 到不了 Windows 回环地址，因此代理地址填成本机回环（如 `http://127.0.0.1:7897`）时，WSL 后端按「未启用代理」启动（注入了也只会指向一个死端口）；填局域网可达地址则照常注入生效。
 
-## 网络代理（仅对 DSH 生效，GUI 热生效）
+## 网络代理（仅对 DSH 生效）
 
-DSH 本体是纯 Node 进程：既不读 Windows"系统代理"（注册表），全局 `fetch` 默认也不理会 `HTTP_PROXY`/`HTTPS_PROXY`（Node ≥24 需要 `NODE_USE_ENV_PROXY=1` 才启用）；而它的 `.env` 加载器把这几个代理变量列为 bootstrap-only、只认**启动方注入的环境**。因此桌面版把代理做成 wrapper 自己的设置：
+代理能力由 **dsh 本体**提供：`@deepseek-ai/dsh-http-proxy` 从 dsh 0.1.5 起解析启动环境（`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`，大小写皆可）并把结果装成 undici 的全局 dispatcher——模型请求、web 搜索、`web_fetch`、走 HTTP 的 MCP、派生子进程一并覆盖；loopback 永久直连，被拒的 scheme（如 SOCKS）保持直连并在 stderr 报告，且**不读操作系统"系统代理"**。桌面版只做一件事：**把你填的偏好作为启动环境交给 dsh**。
 
-- **GUI**：设置 → 通用设置 → **桌面 → 网络代理**。填地址（如 `http://127.0.0.1:7897`）、勾选启用、点保存——**即时生效，无需重启**。
-- **热生效原理**：GUI 启动时在本地起一个转发中继（127.0.0.1 随机端口），后端环境的代理地址固定指向中继；GUI 内部持有真实上游（Clash 地址或直连），保存即原子切换，新连接立刻走新出口。后端、插件、session、工具调用全部无感跟随。
-- **CLI**：单次启动型进程，每次运行读取最新配置并直接注入真实代理地址（天然就是新配置），与 GUI 共享同一份 settings.json。
-- **作用范围**：环境变量只注入 dsh 进程树，**不写用户/系统全局环境变量，不影响其它程序**。
-- **实际注入**：`HTTP_PROXY` / `http_proxy` / `HTTPS_PROXY` / `https_proxy` / `NO_PROXY` / `no_proxy` / `NODE_USE_ENV_PROXY=1`。直连例外留空时默认 `localhost,127.0.0.1,::1`。
+- **GUI**：设置 → 通用设置 → **桌面 → 网络代理**。填地址（如 `http://127.0.0.1:7897`）、勾选启用、点保存。dsh 的代理策略在每个进程 boot 时解析一次，因此**保存后需重启后端生效**；需要时面板会出现「立即重启后端」按钮（会中断当前会话）。
+- **CLI**：单次启动型进程，每次运行都读取最新配置并注入，天然即时生效；与 GUI 共享同一份 settings.json。
+- **作用范围**：注入前先清掉继承来的同名变量，让保存的偏好（或「直连」）成为唯一事实来源；只作用于 dsh 进程树（插件 / session / 工具调用），**不写用户/系统全局环境变量，不影响其它程序**。
+- **实际注入**：`HTTP_PROXY` / `http_proxy` / `HTTPS_PROXY` / `https_proxy` / `NO_PROXY` / `no_proxy`。直连例外留空时默认 `localhost,127.0.0.1,::1`。`NODE_USE_ENV_PROXY` 不再由 wrapper 代管——那是 dsh 自己的策略在派生子进程时决定的事。
 - **配置文件**（GUI 与 CLI 共享，可手改）：
   - Windows：`%APPDATA%\dsh-desktop\settings.json`
   - Linux（CLI）：`$XDG_CONFIG_HOME/dsh-desktop/settings.json`（默认 `~/.config/...`）
   - 格式：`{"proxy":{"enabled":true,"url":"http://127.0.0.1:7897","noProxy":""},"backend":{"mode":"native"|"wsl","distro":"Ubuntu","deployDir":"~/.local/share/dsh-desktop/backend"}}`
-- 只接受 `http://` / `https://` 代理（HTTP CONNECT 隧道；Clash/v2rayN 等的混合端口直接可用）。文件损坏或字段缺失按"未启用"处理，不会阻塞启动。中继不可用时自动退回静态注入的老行为。
+- 只接受 `http://` / `https://` 代理（HTTP CONNECT 隧道；Clash/v2rayN 等的混合端口直接可用）。文件损坏或字段缺失按「未启用」处理，不会阻塞启动。
+- 也可以把代理写进 `$DSH_HOME/.env`：dsh 对这四个名字在该文件里开了豁免，效果与桌面版设置一致（两种方式都设时以 dsh 自身的层叠规则为准）。
 
 ## 会话通知与提示音（GUI）
 
@@ -103,11 +103,12 @@ pwsh scripts/apply-patches.ps1 -Check # 只看会做什么，不改文件
 
   ```sh
   pwsh scripts/apply-patches.ps1        # 1) 补丁合入 deepseek-harness 检出（幂等）
-  # 2) 在 harness 检出里重建：pnpm run build:lib:client && pnpm run build:web
+  # 2) 在 harness 检出里重建（先 host 再 client：client 编译依赖 typert 生成的类型）
+  pnpm install && pnpm run build:lib:host && pnpm run build:lib:client && pnpm run build:web
   npm run harness:frontend              # 3) 注入仓库 node_modules 与已安装 GUI 的 dist
   ```
 
-  注入脚本先扫描新产物 sourcemap、确认包含补丁标记（`renderSettledCached`）才落盘；首次注入自动把上游原版备份为同级 `dist.upstream-bak`。重启 DSH shell 生效；`node scripts/inject-local-frontend.mjs --restore` 一键回到上游版本，`--status` 查看各处指纹。注入版自带 sourcemap 便于 DevTools 定位——打安装器时 prepare-payload 会按既有规则剔除 .map，不影响发布体积契约。
+  注入脚本先扫描新产物 sourcemap、确认包含补丁标记（`renderSettledCached`），再比对检出 `apps/web/package.json` 的版本与载荷 pin 的 dsh 版本——两者必须一致，否则"上一版检出构建的 dist"会带着标记蒙混过关，打出"新后端 + 旧前端"的错配载荷（排查时可加 `--allow-version-mismatch` 越过）。首次注入自动把上游原版备份为同级 `dist.upstream-bak`。重启 DSH shell 生效；`node scripts/inject-local-frontend.mjs --restore` 一键回到上游版本，`--status` 查看各处指纹。注入版自带 sourcemap 便于 DevTools 定位——打安装器时 prepare-payload 会按既有规则剔除 .map，不影响发布体积契约。
 
 - **出包已自动携带**：`pack-cli` / `pack-gui` 在 `npm ci` 之后、生产闭包复制之前会跑 `scripts/ensure-local-frontend.mjs` 重放上面的注入（幂等），所以只要本机补丁+检出+构建产物齐备，正常打包命令无需任何额外动作；本机没有检出时（如 GitHub runner）自动警告放行官方前端，显式跳过传 `--skip-local-frontend`。
 
@@ -144,8 +145,8 @@ scripts/collect-rust-licenses.mjs  Rust 依赖审计：生成 build/rust-license
 scripts/update-dsh.mjs            上游同步：一键升级 dsh 载荷并验证
 scripts/sync-and-bump.mjs         打包前闸门：查上游→按需同步→递增桌面包后缀（--skip-sync/--skip-bump）
 scripts/apply-patches.ps1         补丁重放：升级 harness 后把 patches/ 合入其源码检出（幂等，-Check 试运行）
-scripts/inject-local-frontend.mjs 本地前端注入：sourcemap 校验 + 自动备份/回滚，覆盖 repo 与已安装 GUI 的 dist
-scripts/ensure-local-frontend.mjs 打包含丁前端闸门：npm ci 后自动重注入补丁版前端（CI 无检出时放行官方流）
+scripts/inject-local-frontend.mjs 本地前端注入：sourcemap 标记校验 + 版本一致性闸门 + 自动备份/回滚，覆盖 repo 与已安装 GUI 的 dist
+scripts/ensure-local-frontend.mjs 打包含丁前端闸门：npm ci 后自动重注入补丁版前端（含版本一致性校验；CI 无检出时放行官方流）
 patches/deepseek-harness-markdown-settled-cache.patch  本地源码补丁：会话消息 settled 渲染 LRU 缓存（性能）
 scripts/desktop-version.mjs       桌面版号规则：官方 dsh 版本 + 本地打包后缀
 scripts/config.mjs                共享打包配置：APP_ID / VERSION 常量、Node 渠道与镜像源

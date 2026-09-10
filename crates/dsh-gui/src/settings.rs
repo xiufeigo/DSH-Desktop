@@ -1,18 +1,22 @@
 //! Wrapper-owned proxy settings for DSH Desktop.
 //!
-//! Why a wrapper-owned file: the DeepSeek Harness deliberately accepts
-//! network-bootstrap variables (`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` /
-//! `NODE_USE_ENV_PROXY`) only from the launching environment — its `.env`
-//! loader rejects those names as bootstrap-only. The desktop wrapper IS that
-//! launching environment, so the preference lives in
-//! `%APPDATA%\dsh-desktop\settings.json` and is injected into the spawned
-//! dsh web process; every plugin, session shell, and tool call beneath it
-//! inherits the same environment. Nothing here touches machine-wide
-//! environment variables or other applications.
+//! The desktop wrapper is the *launching environment* of the dsh process, and
+//! that is all it has to be: dsh >= 0.1.5 ships `@deepseek-ai/dsh-http-proxy`,
+//! which resolves a proxy policy from the launch environment once per boot and
+//! installs it as undici's global dispatcher — covering every plain `fetch`,
+//! the model requests, web search, `web_fetch`, HTTP MCP servers and spawned
+//! child processes. This module therefore only stores the preference in
+//! `%APPDATA%\dsh-desktop\settings.json` and hands it to the spawned dsh
+//! process as environment variables; every plugin, session shell, and tool
+//! call beneath it inherits the same environment. Nothing here touches
+//! machine-wide environment variables or other applications, and nothing here
+//! re-implements dsh's own resolution rules (loopback bypass, `ALL_PROXY`
+//! fallback, rejection of non-HTTP schemes) — those live upstream now.
 //!
-//! Node's global `fetch` (undici) ignores both the Windows system proxy and
-//! plain `HTTP(S)_PROXY` env vars unless `NODE_USE_ENV_PROXY=1` is set
-//! (Node >= 24), which is exactly what this module writes alongside them.
+//! Two consequences worth stating: the policy is read once per boot, so a
+//! saved change takes effect after a backend restart; and dsh deliberately
+//! does not read the operating system's proxy settings, which is why this GUI
+//! switch still exists for users whose proxy client only flips "system proxy".
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -104,6 +108,10 @@ impl ProxySettings {
     /// Uppercase for Node/undici plus lowercase duplicates so non-Node tools
     /// that only read the lowercase spellings (common curl/pip/git configs)
     /// behave the same inside sessions and tool calls.
+    ///
+    /// `NODE_USE_ENV_PROXY` is deliberately absent: dsh's own
+    /// `@deepseek-ai/dsh-http-proxy` policy installs the dispatcher in-process
+    /// and decides for itself whether to hand that flag to child processes.
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let bypass = if self.no_proxy.is_empty() {
             DEFAULT_NO_PROXY.to_string()
@@ -117,21 +125,23 @@ impl ProxySettings {
             ("https_proxy".into(), self.url.clone()),
             ("NO_PROXY".into(), bypass.clone()),
             ("no_proxy".into(), bypass),
-            ("NODE_USE_ENV_PROXY".into(), "1".into()),
         ]
     }
 
-    /// Apply the entries onto a child command when effective.
-    pub fn apply_to(&self, cmd: &mut std::process::Command) -> bool {
-        match self.effective() {
-            Some(effective) => {
-                for (name, value) in effective.env_vars() {
-                    cmd.env(name, value);
-                }
-                true
-            }
-            None => false,
-        }
+    /// Whether a proxy URL's host is a local loopback address. A WSL2 backend
+    /// cannot reach the Windows loopback, so such an address is treated as
+    /// "no proxy" there rather than handing the Linux backend a dead port.
+    pub fn targets_loopback(url: &str) -> bool {
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+            bracketed.split(']').next().unwrap_or(bracketed)
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        };
+        let host = host.trim().to_ascii_lowercase();
+        host == "localhost" || host == "::1" || host.starts_with("127.")
     }
 }
 
@@ -248,7 +258,6 @@ mod tests {
             "https_proxy",
             "NO_PROXY",
             "no_proxy",
-            "NODE_USE_ENV_PROXY",
         ] {
             assert!(
                 vars.iter().any(|(key, _)| key == name),
@@ -273,6 +282,26 @@ mod tests {
             vars.iter().find(|(key, _)| key == "NO_PROXY").unwrap().1,
             DEFAULT_NO_PROXY
         );
+    }
+
+    #[test]
+    fn loopback_proxy_hosts_are_recognized_for_wsl() {
+        for url in [
+            "http://127.0.0.1:7897",
+            "http://localhost:7897",
+            "http://[::1]:7897",
+            "https://user:pass@127.0.0.1:8080",
+            "http://127.0.0.1:7897/",
+        ] {
+            assert!(ProxySettings::targets_loopback(url), "{url} must count as loopback");
+        }
+        for url in [
+            "http://192.168.1.10:7897",
+            "http://proxy.internal:3128",
+            "http://[2001:db8::1]:3128",
+        ] {
+            assert!(!ProxySettings::targets_loopback(url), "{url} must not count as loopback");
+        }
     }
 
     #[test]
@@ -335,18 +364,5 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert_eq!(load_backend_from(&path), BackendSettings::default());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn apply_to_reports_whether_injection_happened() {
-        let mut cmd = std::process::Command::new("node");
-        assert!(!ProxySettings::default().apply_to(&mut cmd));
-
-        let entry = ProxySettings {
-            enabled: true,
-            url: "http://127.0.0.1:7897".into(),
-            no_proxy: String::new(),
-        };
-        assert!(entry.apply_to(&mut cmd));
     }
 }

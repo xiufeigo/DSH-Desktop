@@ -17,6 +17,9 @@
  *   - 首次注入前把上游原版 dist 备份为同级 dist.upstream-bak（此后永不覆盖该备份）；
  *   - 注入前扫描本地构建的 sourcemap 确认包含补丁标记 renderSettledCached，
  *     找不到即拒绝注入（--allow-unverified 可越过）；
+ *   - 注入前比对检出 `apps/web/package.json` 的版本与载荷 pin 的 dsh 版本：
+ *     只认标记会放过"上一版检出构建的 dist"，那正是后端/前端错配的来源
+ *     （--allow-version-mismatch 可越过）；
  *   - 注入幂等：目标与本地产物指纹一致时跳过。
  *
  * 用法：
@@ -25,6 +28,7 @@
  *   node scripts/inject-local-frontend.mjs --restore    # 从备份回滚为上游 dist
  *   --only repo|gui       只处理其中一个目标
  *   --allow-unverified    sourcemap 标记校验失败时仍允许注入（排查用）
+ *   --allow-version-mismatch  构建版本与载荷 pin 不一致时仍允许注入（排查用）
  *   --harness <dir>       指定 deepseek-harness 检出（默认 ../deepseek-harness 或 $DSH_HARNESS_PATH）
  */
 import { createHash } from 'node:crypto'
@@ -158,6 +162,24 @@ if (marker.hit) {
 } else {
   console.error('[error] 本地产物的 sourcemap 不含补丁标记 renderSettledCached —— 先确认补丁已应用且 build 完成，或加 --allow-unverified')
   process.exit(1)
+}
+
+// 版本闸门：标记相同不代表版本相同。上一版检出构建出的 dist 一样带标记，
+// 注入进新版载荷就会得到"新后端 + 旧前端"的错配组合。
+const buildVersion = JSON.parse(readFileSync(join(harness, 'apps', 'web', 'package.json'), 'utf8')).version
+const pinnedVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).dependencies['@deepseek-ai/dsh']
+if (buildVersion !== pinnedVersion) {
+  if (!hasFlag('--allow-version-mismatch')) {
+    console.error(
+      `[error] 本地构建的补丁前端是 ${buildVersion}，载荷 pin 的是 ${pinnedVersion}：` +
+      `注入会得到"新后端 + 旧前端"的错配组合。请在检出切到 dsh-v${pinnedVersion} 后重建，` +
+      '或加 --allow-version-mismatch 强制注入。',
+    )
+    process.exit(1)
+  }
+  console.warn(`[warn] 版本不一致（构建 ${buildVersion} / pin ${pinnedVersion}），按 --allow-version-mismatch 继续`)
+} else {
+  console.log(`前端版本与载荷一致 —— ${pinnedVersion}`)
 }
 
 let changed = 0

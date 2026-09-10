@@ -784,9 +784,11 @@
         proxyNoProxy: 'Bypass list (NO_PROXY)',
         proxyNoProxyHint: 'Comma-separated hosts that skip the proxy. Blank uses localhost,127.0.0.1,::1.',
         proxyApply: 'Save',
-        proxyApplyWarn: 'Applies immediately to new connections — no restart needed.',
+        proxyApplyWarn: 'dsh resolves the proxy from its launch environment at boot (@deepseek-ai/dsh-http-proxy) — restart the backend to apply a saved change.',
+        proxyRestart: 'Restart backend now',
+        proxyRestartHint: 'Saved change pending — restart the backend to apply it.',
         proxyActiveOn: 'Traffic is going through: %s',
-        proxyPending: 'Proxy on.',
+        proxyPending: 'Proxy saved — restart the backend to apply.',
         proxyOff: 'Direct connection (no proxy).',
         applying: 'Saving…',
         proxyError: 'Failed: ',
@@ -838,9 +840,11 @@
       proxyNoProxy: '直连例外（NO_PROXY）',
       proxyNoProxyHint: '逗号分隔、不走代理的主机；留空默认 localhost,127.0.0.1,::1。',
       proxyApply: '保存',
-      proxyApplyWarn: '新连接即时生效，无需重启。',
+      proxyApplyWarn: 'dsh 在启动时从启动环境解析代理并装为全局 dispatcher（@deepseek-ai/dsh-http-proxy）——保存后需重启后端生效。',
+      proxyRestart: '立即重启后端',
+      proxyRestartHint: '已保存的改动待生效——重启后端后应用。',
       proxyActiveOn: '流量正经过：%s',
-      proxyPending: '代理已开启。',
+      proxyPending: '代理已保存——重启后端后生效。',
       proxyOff: '未启用——当前直连。',
       applying: '正在保存…',
       proxyError: '失败：',
@@ -1256,9 +1260,10 @@
     panel.appendChild(reset)
 
     // —— 网络代理：wrapper 层偏好，保存到 %APPDATA%\dsh-desktop\settings.json。
-    // 后端环境固定指向 GUI 内置的本地中继(127.0.0.1 随机端口)，这里保存后
-    // 由 Rust 端热切换中继上游——新连接立即生效，无需重启后端；只影响本
-    // 应用及其子进程（插件 / session / 工具调用），不写系统全局环境。
+    // 保存的值只在 spawn 后端时作为启动环境注入；dsh ≥ 0.1.5 自己从启动环境
+    // 解析代理策略并在任何插件挂载前装为 undici 全局 dispatcher
+    // （@deepseek-ai/dsh-http-proxy），因此保存后需重启后端才会被读取。只影响
+    // 本应用及其子进程（插件 / session / 工具调用），不写系统全局环境。
     const proxyHeading = document.createElement('div')
     proxyHeading.className = 'dsh-gui-settings-title'
     proxyHeading.textContent = copy.proxyTitle
@@ -1266,6 +1271,8 @@
 
     let proxySaved = null
     let proxyActiveUrl = null
+    let proxyRestartRequired = false
+    let proxyRestarting = false
     let proxyLoaded = false
 
     const enableRow = document.createElement('div')
@@ -1326,6 +1333,46 @@
     applyWarn.textContent = copy.proxyApplyWarn
     panel.appendChild(applyWarn)
 
+    // 只有"已保存但尚未被后端读取"时才出现：dsh 的代理策略每个进程只解析一次。
+    const proxyRestart = document.createElement('button')
+    proxyRestart.type = 'button'
+    proxyRestart.className = 'dsh-gui-settings-apply'
+    proxyRestart.textContent = copy.proxyRestart
+    proxyRestart.hidden = true
+    panel.appendChild(proxyRestart)
+
+    function syncProxyRestart() {
+      proxyRestart.hidden = !proxyRestartRequired
+      proxyRestart.disabled = !proxyRestartRequired || proxyRestarting
+    }
+
+    proxyRestart.addEventListener('click', function () {
+      if (proxyRestart.disabled) return
+      proxyRestarting = true
+      syncProxyRestart()
+      proxyStatus.textContent = copy.backendSaved
+      tauriInvoke('restart_backend')
+        .then(function () {
+          proxyRestarting = false
+          return tauriInvoke('get_proxy_settings')
+        })
+        .then(function (state) {
+          if (panel.isConnected && state) {
+            proxySaved = state.saved || {}
+            proxyActiveUrl = state.activeUrl || null
+            proxyRestartRequired = Boolean(state.restartRequired)
+            proxyStatus.textContent = proxyStatusText()
+          }
+          syncProxyRestart()
+        })
+        .catch(function (error) {
+          proxyRestarting = false
+          proxyStatus.textContent =
+            copy.proxyError + String((error && error.message) || error || '')
+          syncProxyRestart()
+        })
+    })
+
     function syncProxyControls() {
       const on = proxyBox.checked
       proxyUrlInput.disabled = !on || !proxyLoaded
@@ -1335,6 +1382,7 @@
 
     function proxyStatusText() {
       if (!proxyLoaded) return ''
+      if (proxyRestartRequired) return copy.proxyRestartHint
       if (proxyActiveUrl) return copy.proxyActiveOn.replace('%s', proxyActiveUrl)
       if (proxySaved && proxySaved.enabled) return copy.proxyPending
       return copy.proxyOff
@@ -1352,16 +1400,18 @@
         noProxy: proxyBypassInput.value.trim(),
       })
         .then(function () {
-          // 保存即热切换；回读一次让状态行立刻反映当前出口。
+          // 保存只落盘；回读一次让状态行反映"是否待重启生效"。
           return tauriInvoke('get_proxy_settings')
         })
         .then(function (state) {
           if (panel.isConnected && state) {
             proxySaved = state.saved || {}
             proxyActiveUrl = state.activeUrl || null
+            proxyRestartRequired = Boolean(state.restartRequired)
             proxyStatus.textContent = proxyStatusText()
           }
           proxyApply.disabled = false
+          syncProxyRestart()
         })
         .catch(function (error) {
           proxyStatus.textContent =
@@ -1374,11 +1424,13 @@
       if (!panel.isConnected || !state) return
       proxySaved = state.saved || {}
       proxyActiveUrl = state.activeUrl || null
+      proxyRestartRequired = Boolean(state.restartRequired)
       proxyLoaded = true
       proxyBox.checked = Boolean(proxySaved.enabled)
       proxyUrlInput.value = String(proxySaved.url || '')
       proxyBypassInput.value = String(proxySaved.noProxy || '')
       syncProxyControls()
+      syncProxyRestart()
       proxyStatus.textContent = proxyStatusText()
     }, function () {
       if (!panel.isConnected) return

@@ -64,6 +64,14 @@ impl fmt::Display for WaitReadyError {
 /// BrowserAuth). Older releases print a bare URL. The query must be preserved
 /// verbatim: without it every index request answers 401 and the UI never
 /// loads.
+///
+/// Two later upstream shapes share this prefix and must not be mistaken for
+/// the endpoint: 0.1.5 appends a ` (LAN: <url>)` suffix when a LAN address is
+/// bound, and the browser-handoff notice (`dsh web: opening the default
+/// browser; pass --no-open to disable`) prints on its own line. Only the first
+/// whitespace-delimited token of a line is considered, and a line whose first
+/// token is not an http(s) URL is skipped instead of failing the whole
+/// startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerEndpoint {
     pub port: u16,
@@ -73,9 +81,15 @@ pub struct ServerEndpoint {
 
 pub fn parse_server_endpoint(log: &str) -> Result<Option<ServerEndpoint>, WaitReadyError> {
     for line in log.lines() {
-        let Some(endpoint) = line.trim().strip_prefix(SERVER_URL_PREFIX) else {
+        let Some(rest) = line.trim().strip_prefix(SERVER_URL_PREFIX) else {
             continue;
         };
+        let Some(endpoint) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            continue;
+        }
         let normalized = endpoint.strip_suffix('/').unwrap_or(endpoint);
         // Split off the query before validating the loopback URL: the port
         // must be parsed from the authority only.
@@ -389,6 +403,32 @@ mod tests {
         assert_eq!(
             parse_server_endpoint("dsh web: http://127.0.0.1:49152/\n"),
             Ok(Some(ServerEndpoint { port: 49_152, query: None }))
+        );
+    }
+
+    #[test]
+    fn skips_informational_lines_and_drops_a_lan_suffix() {
+        // 0.1.5 prints the browser-handoff notice, then the endpoint line.
+        assert_eq!(
+            parse_server_endpoint(
+                "plugin output\n\
+                 dsh web: opening the default browser; pass --no-open to disable\n\
+                 dsh web: http://127.0.0.1:56412/?token=abc\n"
+            ),
+            Ok(Some(ServerEndpoint {
+                port: 56_412,
+                query: Some("token=abc".to_string()),
+            }))
+        );
+        // A bound LAN address appends a second URL that must not enter the token.
+        assert_eq!(
+            parse_server_endpoint(
+                "dsh web: http://127.0.0.1:56412/?token=abc (LAN: http://192.168.1.5:56412/?token=abc)\n"
+            ),
+            Ok(Some(ServerEndpoint {
+                port: 56_412,
+                query: Some("token=abc".to_string()),
+            }))
         );
     }
 

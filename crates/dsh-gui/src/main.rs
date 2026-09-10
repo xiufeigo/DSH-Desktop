@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod relay;
 mod settings;
 mod startup;
 mod wsl;
@@ -25,12 +24,17 @@ use tauri_plugin_notification::NotificationExt;
 use std::os::windows::process::CommandExt;
 
 static SERVER: Mutex<Option<Child>> = Mutex::new(None);
-// 本地转发中继：后端环境里的代理地址永远指向它；上游指向(Clash/直连)
-// 由 RELAY_TARGET 持有，改设置即时切换，无需重启后端。
-static RELAY_TARGET: OnceLock<relay::RelayTarget> = OnceLock::new();
-static RELAY_PORT: AtomicU16 = AtomicU16::new(0);
-// 当前实际生效的出口(Some=经该地址转发,None=直连),供设置面板展示。
+// 后端本次启动实际注入的出口（Some=经该地址转发，None=直连）。dsh ≥ 0.1.5
+// 在 boot 时从启动环境解析代理策略并装为 undici 全局 dispatcher
+// （@deepseek-ai/dsh-http-proxy），策略每个进程只解析一次，因此这里记录的
+// 就是"当前这次启动生效的值"，改设置要重启后端才会被读取。
 static ACTIVE_URL: Mutex<Option<String>> = Mutex::new(None);
+/// 归属 wrapper 的代理变量：注入我们保存的偏好之前先清掉继承值，让启动环境
+/// 只有一个事实来源。`NODE_USE_ENV_PROXY` 不在其中——那是 dsh 自己的策略在
+/// 派生子进程时决定的事，wrapper 不再代管。
+const PROXY_ENV_NAMES: [&str; 6] = [
+    "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
+];
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 static STARTUP_TRACE: OnceLock<StartupTrace> = OnceLock::new();
 static INTERACTIVE_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -131,22 +135,26 @@ fn show_desktop_notification(app: tauri::AppHandle, title: String, body: String)
         .show();
 }
 
-/// Proxy preferences as saved on disk plus the LIVE egress (`active_url` is
-/// null for direct). Thanks to the local relay, `active_url` tracks saves
-/// immediately — no restart involved.
+/// Proxy preference as saved on disk, the egress the running backend was
+/// launched with (`active_url` is null for direct), and whether the two
+/// differ. dsh resolves the proxy policy from its launch environment once per
+/// boot, so a saved change only takes effect after a backend restart.
 #[tauri::command]
 fn get_proxy_settings() -> serde_json::Value {
     let saved = settings::load_proxy();
     let active = ACTIVE_URL.lock().unwrap().clone();
+    let desired = saved.effective().map(|effective| effective.url);
     serde_json::json!({
         "saved": saved,
         "activeUrl": active,
+        "restartRequired": active != desired,
     })
 }
 
-/// Validate + persist + hot-apply. The relay swaps its upstream atomically,
-/// so the next connection from the backend (or any plugin/session/tool child)
-/// already uses the new value.
+/// Validate + persist only. The running backend keeps the policy it was
+/// launched with until it restarts, mirroring the official mechanism: dsh
+/// parses the launch environment once and installs the result as undici's
+/// global dispatcher.
 #[tauri::command]
 fn set_proxy_settings(enabled: bool, url: String, no_proxy: String) -> Result<(), String> {
     let entry = settings::ProxySettings {
@@ -157,13 +165,7 @@ fn set_proxy_settings(enabled: bool, url: String, no_proxy: String) -> Result<()
     if enabled && entry.effective().is_none() {
         return Err("代理地址无效：需要 http:// 或 https:// 开头的完整地址（例如 http://127.0.0.1:7897）".to_string());
     }
-    settings::save_proxy(&entry)?;
-    let live = entry.effective().map(|effective| effective.url);
-    if let Some(target) = RELAY_TARGET.get() {
-        target.set(live.clone());
-    }
-    *ACTIVE_URL.lock().unwrap() = live;
-    Ok(())
+    settings::save_proxy(&entry)
 }
 
 /// Backend runtime preference as saved on disk (`saved`), plus whether the
@@ -451,46 +453,44 @@ fn spawn_server() -> std::io::Result<(Child, Receiver<Result<startup::ServerEndp
     }
     let _ = BACKEND_MODE.set(backend.mode.clone());
 
-    // 代理走本地中继：环境变量只写一次、永远指向 127.0.0.1 的 relay 端口；
-    // 上游(Clash 地址或直连)由 GUI 进程持有并可热切换，改设置不用重启后端。
-    // 中继万一没起来，退回老行为——把真实地址静态注入。
-    // （WSL 模式下 wsl.exe 会把环境转发进发行版；但中继绑定的是 Windows
-    //  回环地址，WSL2 VM 内不可见，MVP 不做跨 VM 代理桥接，仅随命令透传。）
+    // 代理只写进 dsh 的启动环境：dsh ≥ 0.1.5 从启动环境解析代理策略，并在任何
+    // 插件挂载之前把它装成 undici 的全局 dispatcher（@deepseek-ai/dsh-http-proxy），
+    // 模型请求、web 搜索、web_fetch、走 HTTP 的 MCP 与派生子进程一并覆盖。
+    // 因此 wrapper 不再需要本地中继，也不再代管 NODE_USE_ENV_PROXY。
     let saved = settings::load_proxy();
-    let bypass = if saved.no_proxy.trim().is_empty() {
-        settings::DEFAULT_NO_PROXY.to_string()
-    } else {
-        saved.no_proxy.trim().to_string()
-    };
-    let relay_port = RELAY_PORT.load(Ordering::Acquire);
     let applied: Option<String> = if backend.is_wsl() {
-        // WSL2 NAT cannot reach Windows 127.0.0.1. Remove inherited proxy
-        // variables rather than handing the Linux backend a dead GUI relay.
-        for name in [
-            "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
-            "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY",
-        ] {
+        // WSL2 的 VM 到不了 Windows 回环地址：代理指向本机回环时注入进去只会
+        // 把 Linux 后端指向一个死端口，按"未启用"处理并清掉继承值；指向 VM
+        // 可达主机（局域网地址）的代理照常注入。
+        let reachable = saved
+            .effective()
+            .filter(|effective| !settings::ProxySettings::targets_loopback(&effective.url));
+        for name in PROXY_ENV_NAMES {
             cmd.env_remove(name);
         }
-        None
-    } else if relay_port != 0 {
-        let url = format!("http://127.0.0.1:{relay_port}");
-        for (name, value) in [
-            ("HTTP_PROXY", url.clone()),
-            ("http_proxy", url.clone()),
-            ("HTTPS_PROXY", url.clone()),
-            ("https_proxy", url.clone()),
-            ("NO_PROXY", bypass.clone()),
-            ("no_proxy", bypass),
-            ("NODE_USE_ENV_PROXY", "1".to_string()),
-        ] {
-            cmd.env(name, value);
+        match reachable {
+            Some(effective) => {
+                for (name, value) in effective.env_vars() {
+                    cmd.env(name, value);
+                }
+                Some(effective.url)
+            }
+            None => None,
         }
-        Some(url)
-    } else if saved.apply_to(&mut cmd) {
-        Some(saved.url.trim().trim_end_matches('/').to_string())
     } else {
-        None
+        // 继承来的代理变量一律清掉：保存的偏好（或"直连"）是唯一事实来源。
+        for name in PROXY_ENV_NAMES {
+            cmd.env_remove(name);
+        }
+        match saved.effective() {
+            Some(effective) => {
+                for (name, value) in effective.env_vars() {
+                    cmd.env(name, value);
+                }
+                Some(effective.url)
+            }
+            None => None,
+        }
     };
     *ACTIVE_URL.lock().unwrap() = applied.clone();
     if let Some(url) = &applied {
@@ -764,24 +764,6 @@ fn main() {
                 trace_startup("startup_failed", Some("WebView2 runtime missing"));
                 show_webview2_missing();
                 std::process::exit(2);
-            }
-
-            // 先起本地中继，后端环境才能在 spawn 时指向它（热加载的根基）。
-            let saved_proxy = settings::load_proxy();
-            let relay_target = relay::RelayTarget::new(if saved_proxy.enabled {
-                Some(saved_proxy.url.clone())
-            } else {
-                None
-            });
-            match relay::spawn(relay_target.clone()) {
-                Ok(port) => {
-                    RELAY_PORT.store(port, Ordering::Release);
-                    let _ = RELAY_TARGET.set(relay_target);
-                    trace_startup("relay_listening", Some(&format!("port={port}")));
-                }
-                Err(error) => {
-                    trace_startup("relay_failed", Some(&error.to_string()));
-                }
             }
 
             let endpoint = match spawn_server() {
