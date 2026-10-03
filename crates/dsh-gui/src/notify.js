@@ -10,6 +10,8 @@
  *     those rows also flag recovered tool-call failures, while this marker
  *     appears only for a turn that actually died — retry attempts render a
  *     separate card and stay silent, like opencode's session.error channel.
+ *     Since 0.2.0 that same card is reused for a deliberate sign-out
+ *     (ACCOUNT_SIGNED_OUT), which is a stop, not a failure, and stays silent.
  *   - max-tokens turn ends use their own title class and don't count as errors
  *
  * Channels mirror opencode's General settings (MIT):
@@ -45,6 +47,9 @@
   const LEGACY_COOKIE = 'dsh_gui_notify_v1'
   const LEGACY_STORAGE = 'dsh-gui.notify-v1'
   const STOP_LABELS = ['停止生成', 'Stop generating']
+  // 0.2.0 reuses the TurnErrorItem card for a deliberate sign-out, so the
+  // errors channel must tell that card apart from a real turn failure.
+  const SIGNED_OUT_CODE = 'ACCOUNT_SIGNED_OUT'
   const COMPLETE_WAIT_MS = 700
   // A single failed turn can surface several cards in one mutation burst
   // (turn error + trailing renders); collapse the burst into a single ping.
@@ -266,14 +271,30 @@
     return ''
   }
 
-  // Terminal turn failures render a TurnErrorItem card whose title span is
-  // unique to that component (the max-tokens notice uses maxTokensTitle).
+  // The turnErrorTitle span also covers a signed-out stop (its title is
+  // message.accountStopped), so drop those cards. Matching the printed code is
+  // locale-proof and mirrors the `node.code === "ACCOUNT_SIGNED_OUT"` branch
+  // upstream renders from, unlike the localized title text.
+  function errorTitleNodes() {
+    const nodes = []
+    const titles = document.querySelectorAll('[class*="turnErrorTitle"]')
+    for (let i = 0; i < titles.length; i += 1) {
+      const card = titles[i].closest('[class*="turnErrorRow"]')
+      const code = card && card.querySelector('[class*="turnErrorCode"]')
+      if (code && clip(code.textContent) === SIGNED_OUT_CODE) continue
+      nodes.push(titles[i])
+    }
+    return nodes
+  }
+
+  // How many turn failures this session has rendered so far; the max-tokens
+  // notice uses maxTokensTitle and never lands here.
   function errorRowCount() {
-    return document.querySelectorAll('[class*="turnErrorTitle"]').length
+    return errorTitleNodes().length
   }
 
   function latestErrorText() {
-    const cards = document.querySelectorAll('[class*="turnErrorTitle"]')
+    const cards = errorTitleNodes()
     const last = cards.length ? cards[cards.length - 1] : null
     const copy = last && last.parentElement
     return copy ? clip(copy.textContent) : ''

@@ -123,8 +123,13 @@ fn extract_payload(archive: &[u8], dir: &Path, ready: &Path) -> Result<(), Strin
     if ready.is_file() {
         return Ok(());
     }
-    eprintln!("dsh-cli: 首次运行，正在解压内置载荷（约 300 MB），仅此一次…");
+    // 先解码再提示：这时的字节数就是真实要落盘的体积，不写死数字，免得载荷
+    // 一变（0.2.0 就把它从 292 MiB 推到 434 MiB）提示还停在旧值。
     let tar_bytes = zstd::stream::decode_all(archive).map_err(|e| format!("载荷解压失败: {e}"))?;
+    eprintln!(
+        "dsh-cli: 首次运行，正在解压内置载荷（{:.0} MB），仅此一次…",
+        tar_bytes.len() as f64 / 1_000_000.0
+    );
     fs::create_dir_all(dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
     let mut ar = tar::Archive::new(&tar_bytes[..]);
     ar.set_preserve_permissions(false);

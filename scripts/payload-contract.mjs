@@ -10,10 +10,14 @@ import {
 import { extname, join, relative } from 'node:path'
 
 export const PAYLOAD_LIMITS = Object.freeze({
-  // Linux 载荷天然比 Windows 大：sharp/node-pty/koffi 等原生模块要同时带
-  // glibc 与 musl 变体。上游闭包增长曾把 Linux 推过 225 MiB（v0.1.1-rc.2.4
-  // 的发布作业因此失败），256 MiB 给后续增长留出余量。
-  bytes: 256 * 1024 * 1024,
+  // dsh 0.2.0 把 Office 文档能力带进了生产闭包：@deepseek-ai/libreoffice-kit
+  // 的当前平台包（win32-x64 约 182 MiB，其中单个转换器 exe 就 170 MiB）。这不是
+  // 上游的分发失误——官方 Electron 桌面版自己的 runtime-file-policy 也只剔除
+  // 其它平台的 kit、保留当前平台的。Windows 载荷因此从约 193 MiB 涨到约 434 MiB。
+  // Linux 仍天然更大：sharp/node-pty/koffi 等原生模块要同时带 glibc 与 musl 变体
+  // （上游闭包增长曾把 Linux 推过 225 MiB，v0.1.1-rc.2.4 的发布作业因此失败）。
+  // 512 MiB 为后续增长留出余量，同时仍然守住「体积失控」这道闸门。
+  bytes: 512 * 1024 * 1024,
   files: 15_000,
 })
 

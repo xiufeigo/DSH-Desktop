@@ -32,12 +32,6 @@
  *     node if React remounts the section; it is removed on every other tab.
  *     Desktop notifications (session finished / approval / questions) are a
  *     separate injected script (`notify.js`) toggled from this same panel.
- *   - Details-column drag: upstream clamps the right pane to 300–520px inside
- *     ui-layout's private store, which DSH-Explorer cannot override. The
- *     plugin's `--fork-width` patch targets a local harness checkout and is
- *     wiped whenever this desktop payload resyncs. Before the layout factory
- *     registers, the shell rewrites those two clamp sites to 1200 (same
- *     contract as the plugin) and mirrors width into localStorage.
  *   - The sidebar column is marked once; a descendant CSS rule then clears
  *     painted backgrounds INSIDE that column only, so the window acrylic
  *     shows through even when upstream stacks many solid wrappers. Dialogs
@@ -75,8 +69,6 @@
   const DEFAULT_EN_FONT = 'Segoe UI'
   const DEFAULT_ZH_FONT = 'Microsoft YaHei'
   const DEFAULT_CODE_FONT = 'Consolas'
-  const DETAILS_MAX = 1200
-  const DETAILS_WIDTH_KEY = 'dsh-explorer:details-width'
   const LATIN_RANGE = 'U+0000-024F,U+1E00-1EFF,U+2000-218F,U+2190-21FF,U+2200-22FF'
   const CJK_RANGE = 'U+2E80-9FFF,U+F900-FAFF,U+FE10-FE1F,U+FE30-FE4F,U+FF00-FFEF,U+20000-2FA1F'
   // 提示音清单：与 scripts/make-audio.mjs 的 GROUPS 及 audio.js 内嵌资源一一
@@ -1824,89 +1816,6 @@
     watchSurfaces()
     return true
   }
-
-  /**
-   * DSH-Explorer embeds in the official details column. Upstream's layout
-   * store clamps that column to 520px (and computeColumns uses the same
-   * ceiling), so dragging feels stuck after a payload sync wipes the
-   * plugin's harness fork. Rewrite the factory text before it registers.
-   */
-  function rewriteLayoutFactory(factory) {
-    let source
-    try {
-      source = Function.prototype.toString.call(factory)
-    } catch (_error) {
-      return factory
-    }
-    if (!source || source.indexOf('[native code]') !== -1) return factory
-    if (
-      source.indexOf('clampWidth(px, 300, 520)') === -1 &&
-      source.indexOf('clampWidth(details, 300, 520)') === -1
-    ) {
-      return factory
-    }
-    let patched = source
-      .split('clampWidth(details, 300, 520)').join('clampWidth(details, 300, ' + DETAILS_MAX + ')')
-      .split('clampWidth(px, 300, 520)').join('clampWidth(px, 300, ' + DETAILS_MAX + ')')
-    if (patched.indexOf(DETAILS_WIDTH_KEY) === -1) {
-      patched = patched.replace(
-        /d\.details\s*=\s*clampWidth\(\s*px\s*,\s*300\s*,\s*1200\s*\)\s*;/,
-        'd.details = clampWidth(px, 300, ' + DETAILS_MAX + '); try { localStorage.setItem("' + DETAILS_WIDTH_KEY + '", String(d.details)); } catch (_e) {}',
-      )
-      patched = patched.replace(
-        /if\s*\(\s*d\.details\s*===\s*0\s*\)\s*d\.details\s*=\s*360\s*;/,
-        'if (d.details === 0) { var __w = 360; try { var __r = localStorage.getItem("' + DETAILS_WIDTH_KEY + '"); if (__r) { var __n = Number(__r); if (__n >= 300) __w = Math.min(' + DETAILS_MAX + ', Math.max(300, Math.round(__n))); } } catch (_e) {} d.details = __w; }',
-      )
-    }
-    try {
-      return (new Function('return (' + patched + ')'))()
-    } catch (_error) {
-      return factory
-    }
-  }
-
-  function wrapModuleLoader(loader) {
-    if (!loader || typeof loader.load !== 'function' || loader.__dshGuiLayoutFork) return loader
-    const original = loader.load
-    loader.load = function (handoff) {
-      if (
-        handoff &&
-        handoff.id === '@deepseek-ai/dsh-client-ui-layout' &&
-        typeof handoff.factory === 'function'
-      ) {
-        handoff.factory = rewriteLayoutFactory(handoff.factory)
-      }
-      return original.call(this, handoff)
-    }
-    loader.__dshGuiLayoutFork = true
-    return loader
-  }
-
-  function installLayoutWidthFork() {
-    let held
-    try {
-      held = window.__ModuleLoader__
-    } catch (_error) {
-      held = undefined
-    }
-    wrapModuleLoader(held)
-    try {
-      Object.defineProperty(window, '__ModuleLoader__', {
-        configurable: true,
-        enumerable: true,
-        get: function () {
-          return held
-        },
-        set: function (value) {
-          held = wrapModuleLoader(value)
-        },
-      })
-    } catch (_error) {
-      wrapModuleLoader(window.__ModuleLoader__)
-    }
-  }
-
-  installLayoutWidthFork()
 
   function boot() {
     currentTint = readStoredTint()
