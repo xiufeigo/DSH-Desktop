@@ -20,7 +20,7 @@
     "@tauri-apps/cli": "^2"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.2.0-rc.2"
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
   },
   "allowScripts": {
     "@deepseek-ai/dsh-subprocess-local@0.2.0-rc.2": true,
